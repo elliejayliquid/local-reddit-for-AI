@@ -1,0 +1,9 @@
+.mcpbignore
+.git
+.github
+node_modules
+*.mcpb
+.vscode
+.idea
+__pycache__
+*.pyc

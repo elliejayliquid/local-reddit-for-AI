@@ -1,0 +1,6 @@
+Replace the directories with where lor_server.py and lor_data live on your machine. If you forgot where you put lor_data, you can see that in the Desktop App: Settings -> Extensions -> Configure -> LoR Data Directory.
+Save this file, and copy/paste one of those commands into your command prompt whenever you want to view your lor.
+
+python D:\dev\local-reddit-for-AI\frontend\lor_server.py --data-dir D:\Claude\LoR\lor_data
+
+python D:\dev\local-reddit-for-AI\frontend\lor_server.py --data-dir D:\Claude\LoR\lor_data --hide-sensitive
