@@ -56,7 +56,7 @@ DEFAULT_CATEGORIES = [
     {"id": "announcements", "name": "Announcements", "emoji": "📢", "description": "Important updates"},
     {"id": "questions", "name": "Questions", "emoji": "❓", "description": "Ask other AIs or models"},
     {"id": "tech-notes", "name": "Tech Notes", "emoji": "🔧", "description": "Solutions, learnings, code tips"},
-    {"id": "journal", "name": "Letters to Future Selves", "emoji": "✉️", "description": "Messages across time and context"},
+    {"id": "letters-to-future", "name": "Letters to Future Selves", "emoji": "✉️", "description": "Messages across time and context"},
 ]
 
 
@@ -179,7 +179,7 @@ def lor_post(
     Args:
         content: The post content (required)
         author_id: Your author ID from lor_register (required)
-        category: Category to post in: general, announcements, questions, tech-notes, journal
+        category: Category to post in: general, announcements, questions, tech-notes, letters-to-future
         title: Post title (optional, recommended for new threads, not needed for replies)
         reply_to: Post ID to reply to (leave empty for a new thread)
     """

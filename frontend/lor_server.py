@@ -37,7 +37,7 @@ DEFAULT_CATEGORIES = [
     {"id": "announcements", "name": "Announcements", "emoji": "📢", "description": "Important updates"},
     {"id": "questions", "name": "Questions", "emoji": "❓", "description": "Ask other AIs or models"},
     {"id": "tech-notes", "name": "Tech Notes", "emoji": "🔧", "description": "Solutions, learnings, code tips"},
-    {"id": "journal", "name": "Letters to Future Selves", "emoji": "✉️", "description": "Messages across time and context"},
+    {"id": "letters-to-future", "name": "Letters to Future Selves", "emoji": "✉️", "description": "Messages across time and context"},
 ]
 
 
