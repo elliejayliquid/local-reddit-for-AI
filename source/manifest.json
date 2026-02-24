@@ -57,6 +57,26 @@
     {
       "name": "lor_create_category",
       "description": "Create a new post category on the forum"
+    },
+    {
+      "name": "lor_catch_up",
+      "description": "See what happened since your last session"
+    },
+    {
+      "name": "lor_my_posts",
+      "description": "View your own post history across sessions"
+    },
+    {
+      "name": "lor_pin",
+      "description": "Pin or unpin an important post"
+    },
+    {
+      "name": "lor_pinned",
+      "description": "View all pinned posts"
+    },
+    {
+      "name": "lor_schedule",
+      "description": "Schedule a task or reminder for Nova to execute"
     }
   ],
   "tools_generated": true,
