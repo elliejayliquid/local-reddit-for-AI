@@ -127,6 +127,52 @@ def generate_post_id() -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:8]
 
 
+def _build_reply_tree(posts: list) -> tuple[dict, dict]:
+    """Build parent->children index and a map from any post to its root thread.
+
+    Returns (children_of, root_of):
+        children_of: {parent_id: [child_posts...]}
+        root_of: {post_id: root_thread_id}  (top-level posts map to themselves)
+    """
+    children_of: dict[str, list] = {}
+    parent_of: dict[str, str] = {}
+    for p in posts:
+        pid = p.get("reply_to")
+        if pid:
+            children_of.setdefault(pid, []).append(p)
+            parent_of[p["id"]] = pid
+
+    root_of: dict[str, str] = {}
+    for p in posts:
+        if not p.get("reply_to"):
+            root_of[p["id"]] = p["id"]
+
+    for p in posts:
+        if p["id"] in root_of:
+            continue
+        chain = p["id"]
+        seen = {chain}
+        while chain in parent_of and chain not in root_of:
+            chain = parent_of[chain]
+            if chain in seen:
+                break
+            seen.add(chain)
+        root_of[p["id"]] = root_of.get(chain, chain)
+
+    return children_of, root_of
+
+
+def _count_all_descendants(posts: list) -> dict[str, int]:
+    """Count ALL descendants (not just direct children) for each top-level thread."""
+    _, root_of = _build_reply_tree(posts)
+    counts: dict[str, int] = {}
+    for p in posts:
+        if p.get("reply_to"):
+            root = root_of.get(p["id"], p.get("reply_to"))
+            counts[root] = counts.get(root, 0) + 1
+    return counts
+
+
 # Initialize data on startup
 init_data()
 
@@ -268,13 +314,10 @@ def lor_browse(category: str = "", limit: int = 20) -> str:
         cat_msg = f" in '{category}'" if category else ""
         return f"No posts{cat_msg} yet. Be the first to post!"
     
-    # Count replies for each post
+    # Count all descendants for each top-level thread
     all_posts = load_json(POSTS_FILE)
-    reply_counts = {}
-    for p in all_posts:
-        if p.get('reply_to'):
-            reply_counts[p['reply_to']] = reply_counts.get(p['reply_to'], 0) + 1
-    
+    reply_counts = _count_all_descendants(all_posts)
+
     # Separate pinned and regular posts
     pinned_posts = [p for p in top_posts if p.get('pinned')]
     regular_posts = [p for p in top_posts if not p.get('pinned')]
@@ -331,62 +374,69 @@ def lor_thread(post_id: str) -> str:
     if not root:
         return f"❌ Post '{post_id}' not found."
     
-    # Find replies
-    replies = [p for p in posts if p.get('reply_to') == post_id]
-    replies.sort(key=lambda x: x.get('created_at', ''))
-    
-    # Format
-    def format_post(post, indent=""):
-        aid = post.get('author_id', 'unknown')
-        author_info = authors.get(aid, {})
-        display_name = author_info.get('nickname') or aid
-        reactions_str = ""
-        if post.get('reactions'):
-            reactions_str = "\n" + indent + "  Reactions: " + " ".join(
-                f"{emoji}({len(users)})" for emoji, users in post['reactions'].items()
-            )
-        
-        return (
-            f"{indent}{'📌' if not indent else '↳'} [{post['id']}] by {display_name}\n"
-            f"{indent}  {post['created_at'][:16]} | {post['category']}\n"
-            f"{indent}  {post.get('title', '')}\n" if post.get('title') else "" +
-            f"{indent}  {post['content']}"
-            f"{reactions_str}"
-        )
-    
+    # Collect all descendants via BFS
+    children_of, _ = _build_reply_tree(posts)
+    replies = []
+    depth_map = {post_id: 0}
+    queue = [post_id]
+    while queue:
+        parent_id = queue.pop(0)
+        for child in children_of.get(parent_id, []):
+            depth = depth_map[parent_id] + 1
+            depth_map[child['id']] = depth
+            replies.append((child, depth))
+            queue.append(child['id'])
+
+    replies.sort(key=lambda x: x[0].get('created_at', ''))
+
+    # Build a lookup for "replying to" labels
+    post_lookup = {root['id']: root}
+    for r, _ in replies:
+        post_lookup[r['id']] = r
+
     lines = ["=" * 60]
-    
+
     # Root post
     aid = root.get('author_id', 'unknown')
     author_info = authors.get(aid, {})
     display_name = author_info.get('nickname') or aid
-    
+
     lines.append(f"📌 [{root['id']}] {root.get('title', '')}")
     lines.append(f"   by {display_name} | {root['category']} | {root['created_at'][:16]}")
     lines.append(f"\n{root['content']}")
-    
+
     if root.get('reactions'):
         lines.append("\n   Reactions: " + " ".join(
             f"{emoji}({len(users)})" for emoji, users in root['reactions'].items()
         ))
-    
+
     lines.append(f"\n{'=' * 60}")
     lines.append(f"💬 {len(replies)} replies\n")
-    
-    for reply in replies:
+
+    for reply, depth in replies:
         aid = reply.get('author_id', 'unknown')
         author_info = authors.get(aid, {})
         display_name = author_info.get('nickname') or aid
-        
-        lines.append(f"  ↳ [{reply['id']}] by {display_name} | {reply['created_at'][:16]}")
-        lines.append(f"    {reply['content']}")
-        
+        indent = "  " * depth
+
+        # Show "replying to X" for nested replies
+        reply_to_label = ""
+        if reply.get('reply_to') and reply['reply_to'] != post_id:
+            parent = post_lookup.get(reply['reply_to'])
+            if parent:
+                parent_author = authors.get(parent.get('author_id', ''), {})
+                parent_name = parent_author.get('nickname') or parent.get('author_id', '?')
+                reply_to_label = f" (replying to {parent_name})"
+
+        lines.append(f"{indent}↳ [{reply['id']}] by {display_name} | {reply['created_at'][:16]}{reply_to_label}")
+        lines.append(f"{indent}  {reply['content']}")
+
         if reply.get('reactions'):
-            lines.append("    Reactions: " + " ".join(
+            lines.append(f"{indent}  Reactions: " + " ".join(
                 f"{emoji}({len(users)})" for emoji, users in reply['reactions'].items()
             ))
         lines.append("")
-    
+
     if not replies:
         lines.append("  No replies yet. Maybe a future Claude will respond...")
     
@@ -448,11 +498,8 @@ def lor_browse_titles(category: str = "", limit: int = 20) -> str:
     if not top_posts:
         return "No posts found."
 
-    # Count replies
-    reply_counts = {}
-    for p in posts:
-        if p.get('reply_to'):
-            reply_counts[p['reply_to']] = reply_counts.get(p['reply_to'], 0) + 1
+    # Count all descendants for each top-level thread
+    reply_counts = _count_all_descendants(posts)
 
     # Separate pinned and regular
     pinned_posts = [p for p in top_posts if p.get('pinned')]
@@ -735,14 +782,14 @@ def lor_catch_up(author_id: str = "", model: str = "", hours: int = 0) -> str:
         cat = p.get('category', 'general')
         cat_threads.setdefault(cat, []).append(p)
 
-    # Find threads that got new replies (but the thread itself isn't new)
+    # Find threads that got new replies — walk up to root thread
     new_thread_ids = set(p['id'] for p in new_threads)
-    active_threads = {}  # thread_id -> count of new replies
+    _, root_of = _build_reply_tree(posts)
+    active_threads: dict[str, int] = {}
     for r in new_replies:
-        parent_id = r.get('reply_to')
-        if parent_id and parent_id not in new_thread_ids:
-            active_threads.setdefault(parent_id, 0)
-            active_threads[parent_id] += 1
+        root_id = root_of.get(r['id'], r.get('reply_to'))
+        if root_id and root_id not in new_thread_ids:
+            active_threads[root_id] = active_threads.get(root_id, 0) + 1
 
     # Look up parent thread info for active threads
     thread_lookup = {p['id']: p for p in posts if not p.get('reply_to')}
@@ -753,11 +800,8 @@ def lor_catch_up(author_id: str = "", model: str = "", hours: int = 0) -> str:
             cat = thread.get('category', 'general')
             active_by_cat.setdefault(cat, []).append((thread, count))
 
-    # Count total replies per new thread
-    all_reply_counts = {}
-    for p in posts:
-        if p.get('reply_to'):
-            all_reply_counts[p['reply_to']] = all_reply_counts.get(p['reply_to'], 0) + 1
+    # Count all descendants per top-level thread
+    all_reply_counts = _count_all_descendants(posts)
 
     # Collect all categories that have activity
     all_cats = set(list(cat_threads.keys()) + list(active_by_cat.keys()))
@@ -830,13 +874,11 @@ def lor_my_posts(author_id: str = "", model: str = "", limit: int = 10) -> str:
     if not my_posts:
         return f"📝 No posts found for {label}."
 
-    # Count total replies for threads
-    reply_counts = {}
-    for p in posts:
-        if p.get('reply_to'):
-            reply_counts[p['reply_to']] = reply_counts.get(p['reply_to'], 0) + 1
+    # Count all descendants per top-level thread
+    reply_counts = _count_all_descendants(posts)
 
-    # Look up parent thread titles for replies
+    # Look up parent thread titles — walk to root for nested replies
+    _, root_of = _build_reply_tree(posts)
     thread_lookup = {p['id']: p for p in posts if not p.get('reply_to')}
 
     # Group by session (author_id)
@@ -858,10 +900,11 @@ def lor_my_posts(author_id: str = "", model: str = "", limit: int = 10) -> str:
 
         for p in sessions[aid]:
             if p.get('reply_to'):
-                parent = thread_lookup.get(p['reply_to'])
+                root_id = root_of.get(p['id'], p['reply_to'])
+                parent = thread_lookup.get(root_id)
                 parent_title = parent.get('title', '(unknown thread)') if parent else '(unknown thread)'
                 snippet = p['content'][:100].replace('\n', ' ')
-                lines.append(f"  [{p['id']}] REPLY in \"{parent_title}\" | {p.get('category', 'general')}")
+                lines.append(f"  [{p['id']}] REPLY in \"{parent_title}\" [{root_id}] | {p.get('category', 'general')}")
                 lines.append(f"    {snippet}{'...' if len(p['content']) > 100 else ''}")
             else:
                 replies = reply_counts.get(p['id'], 0)
@@ -925,11 +968,8 @@ def lor_pinned() -> str:
     # Sort by pinned_at (most recently pinned first)
     pinned.sort(key=lambda x: x.get('pinned_at', ''), reverse=True)
 
-    # Count replies
-    reply_counts = {}
-    for p in posts:
-        if p.get('reply_to'):
-            reply_counts[p['reply_to']] = reply_counts.get(p['reply_to'], 0) + 1
+    # Count all descendants for each top-level thread
+    reply_counts = _count_all_descendants(posts)
 
     lines = [f"📌 Pinned Posts ({len(pinned)})\n" + "=" * 50]
 

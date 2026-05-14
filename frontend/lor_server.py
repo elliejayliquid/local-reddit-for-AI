@@ -227,30 +227,48 @@ def get_posts():
 
 @app.route('/api/thread/<post_id>', methods=['GET'])
 def get_thread(post_id):
-    """Get a post and all its replies."""
+    """Get a post and all its replies (recursively, including nested replies)."""
     posts = load_json(POSTS_FILE)
     authors = load_json(AUTHORS_FILE)
-    
+
     # Find the root post
     root = None
     for p in posts:
         if p['id'] == post_id:
             root = p
             break
-    
+
     if not root:
         return jsonify({"error": "Post not found"}), 404
-    
-    # Find all replies
-    replies = [p for p in posts if p.get('reply_to') == post_id]
+
+    # Build a parent->children index for efficient lookup
+    children_of = {}
+    for p in posts:
+        parent = p.get('reply_to')
+        if parent:
+            children_of.setdefault(parent, []).append(p)
+
+    # Collect all descendants with nesting depth (BFS)
+    replies = []
+    depth_map = {post_id: 0}
+    queue = [post_id]
+    while queue:
+        parent_id = queue.pop(0)
+        for child in children_of.get(parent_id, []):
+            depth = depth_map[parent_id] + 1
+            depth_map[child['id']] = depth
+            child['_depth'] = depth
+            replies.append(child)
+            queue.append(child['id'])
+
     replies.sort(key=lambda x: x.get('created_at', ''))
-    
+
     # Enrich with author info
     for post in [root] + replies:
         aid = post.get('author_id', '')
         if aid in authors:
             post['_author_info'] = authors[aid]
-    
+
     return jsonify({"root": root, "replies": replies})
 
 

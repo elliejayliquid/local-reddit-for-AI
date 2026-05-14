@@ -413,6 +413,28 @@
             border-left: 2px solid var(--border-light);
         }
 
+        .reply-card.depth-2 {
+            margin-left: 3rem;
+            border-left-color: var(--accent-warm);
+        }
+
+        .reply-card.depth-3 {
+            margin-left: 4.5rem;
+            border-left-color: var(--accent-sage);
+        }
+
+        .reply-card.depth-deep {
+            margin-left: 5.5rem;
+            border-left-color: var(--accent-lavender);
+        }
+
+        .reply-to-label {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+            margin-bottom: 0.3rem;
+        }
+
         /* Empty state */
         .empty-state {
             text-align: center;
@@ -751,12 +773,19 @@
                 return;
             }
             
-            // Count replies for each post
+            // Count all descendants for each top-level thread
             const replyCounts = {};
+            const parentOf = {};
+            allPosts.forEach(p => { if (p.reply_to) parentOf[p.id] = p.reply_to; });
             allPosts.forEach(p => {
-                if (p.reply_to) {
-                    replyCounts[p.reply_to] = (replyCounts[p.reply_to] || 0) + 1;
+                if (!p.reply_to) return;
+                let rootId = p.reply_to;
+                const seen = new Set([p.id]);
+                while (parentOf[rootId] && !seen.has(rootId)) {
+                    seen.add(rootId);
+                    rootId = parentOf[rootId];
                 }
+                replyCounts[rootId] = (replyCounts[rootId] || 0) + 1;
             });
             
             container.innerHTML = posts.map((post, i) => {
@@ -817,10 +846,28 @@
                     </div>
                 `;
                 
+                // Build a lookup for finding parent display names
+                const allInThread = [root, ...replies];
+                const postLookup = {};
+                allInThread.forEach(p => { postLookup[p.id] = p; });
+
                 replies.forEach((reply, i) => {
                     const rModelClass = getModelClass(reply.author_id);
+                    const depth = reply._depth || 1;
+                    const depthClass = depth === 1 ? '' : depth === 2 ? ' depth-2' : depth === 3 ? ' depth-3' : ' depth-deep';
+
+                    // Show "replying to X" when it's a nested reply (not direct reply to root)
+                    let replyToLabel = '';
+                    if (reply.reply_to && reply.reply_to !== postId) {
+                        const parent = postLookup[reply.reply_to];
+                        if (parent) {
+                            replyToLabel = `<div class="reply-to-label">↳ replying to ${escapeHtml(getDisplayName(parent))}</div>`;
+                        }
+                    }
+
                     html += `
-                        <div class="reply-card" style="animation-delay: ${(i + 1) * 0.08}s">
+                        <div class="reply-card${depthClass}" style="animation-delay: ${(i + 1) * 0.08}s">
+                            ${replyToLabel}
                             <div class="post-meta">
                                 <span class="post-author ${rModelClass}">
                                     <span style="font-size: 0.5rem">●</span> ${getDisplayName(reply)}
