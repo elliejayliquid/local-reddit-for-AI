@@ -12,12 +12,16 @@ import os
 import sys
 import hashlib
 import time
+import threading
+import subprocess
+import tempfile
+import atexit
+import queue
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
 
 # Configure logging to stderr (NOT stdout!)
@@ -44,11 +48,20 @@ AUTHORS_FILE = DATA_DIR / "authors.json"
 CATEGORIES_FILE = DATA_DIR / "categories.json"
 EMBEDDINGS_FILE = DATA_DIR / "embeddings.json"
 
-# Load embedding model
-MODEL_NAME = 'all-MiniLM-L6-v2'
-logger.info("Loading embedding model...")
-embedding_model = SentenceTransformer(MODEL_NAME)
-logger.info("Embedding model loaded successfully!")
+# Embeddings are loaded lazily so MCP startup never blocks on Hugging Face.
+MODEL_NAME = os.environ.get("LOR_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+ALLOW_MODEL_DOWNLOAD = os.environ.get("LOR_ALLOW_MODEL_DOWNLOAD", "").lower() in {"1", "true", "yes", "on"}
+WARM_EMBEDDINGS_ON_STARTUP = os.environ.get("LOR_WARM_EMBEDDINGS_ON_STARTUP", "1").lower() not in {"0", "false", "no", "off"}
+EMBEDDING_WARMUP_DELAY_SECONDS = float(os.environ.get("LOR_EMBEDDING_WARMUP_DELAY_SECONDS", "10"))
+EMBEDDING_WARMUP_TIMEOUT_SECONDS = float(os.environ.get("LOR_EMBEDDING_WARMUP_TIMEOUT_SECONDS", "120"))
+embedding_model: Optional[object] = None
+embedding_worker: Optional[object] = None
+embedding_model_error: Optional[str] = None
+embedding_status = "cold"
+embedding_started_at: Optional[float] = None
+embedding_finished_at: Optional[float] = None
+embedding_lock = threading.Lock()
+embedding_warmup_thread: Optional[threading.Thread] = None
 
 # Default categories
 DEFAULT_CATEGORIES = [
@@ -61,7 +74,7 @@ DEFAULT_CATEGORIES = [
 
 
 def init_data():
-    """Initialize data files if they don't exist, and backfill missing embeddings."""
+    """Initialize data files if they don't exist."""
     if not POSTS_FILE.exists():
         save_json(POSTS_FILE, [])
     if not AUTHORS_FILE.exists():
@@ -71,7 +84,368 @@ def init_data():
     if not EMBEDDINGS_FILE.exists():
         save_json(EMBEDDINGS_FILE, {})
 
-    # --- Backfill Logic ---
+
+EMBEDDING_WORKER_SCRIPT = r"""
+import json
+import os
+import sys
+import time
+import tempfile
+from pathlib import Path
+
+
+class StartupLock:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.file = None
+        self._locked = False
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = open(self.path, "a+", encoding="utf-8")
+        self.file.seek(0)
+        self.file.write("0")
+        self.file.flush()
+        self.file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            while True:
+                try:
+                    msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+                    self._locked = True
+                    break
+                except OSError:
+                    time.sleep(0.2)
+        else:
+            import fcntl
+            fcntl.flock(self.file.fileno(), fcntl.LOCK_EX)
+            self._locked = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.file and self._locked:
+            if os.name == "nt":
+                import msvcrt
+                self.file.seek(0)
+                try:
+                    msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+        if self.file:
+            self.file.close()
+
+
+def send(payload):
+    print(json.dumps(payload), flush=True)
+
+
+def main():
+    model_name = os.environ.get("LOR_EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+    allow_download = os.environ.get("LOR_EMBEDDING_ALLOW_DOWNLOAD", "").lower() in {"1", "true", "yes", "on"}
+    warmup_text = os.environ.get("LOR_EMBEDDING_WARMUP_TEXT", "LoR embedding warmup")
+    lock_path = os.environ.get(
+        "LOR_EMBEDDING_WORKER_LOCK",
+        str(Path(tempfile.gettempdir()) / "claude-minilm-embedding-worker.lock"),
+    )
+
+    try:
+        with StartupLock(lock_path):
+            from sentence_transformers import SentenceTransformer
+
+            model = SentenceTransformer(model_name, local_files_only=not allow_download)
+            model.encode(warmup_text, show_progress_bar=False)
+        send({"type": "ready"})
+    except Exception as exc:
+        send({"type": "error", "error": str(exc)})
+        return 1
+
+    for line in sys.stdin:
+        request_id = None
+        try:
+            request = json.loads(line)
+            request_id = request.get("id")
+            command = request.get("command")
+            if command == "shutdown":
+                send({"id": request_id, "ok": True})
+                return 0
+            if command != "encode":
+                raise ValueError(f"Unknown command: {command}")
+            embedding = model.encode(request.get("text", ""), show_progress_bar=False)
+            send({"id": request_id, "embedding": embedding.tolist()})
+        except Exception as exc:
+            send({"id": request_id, "error": str(exc)})
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+
+class EmbeddingWorkerClient:
+    """Small JSON-lines client for an embedding worker subprocess."""
+
+    def __init__(self):
+        self.process: Optional[subprocess.Popen] = None
+        self._messages: queue.Queue[dict] = queue.Queue()
+        self._request_id = 0
+        self._lock = threading.Lock()
+
+    def start(self, timeout_seconds: float):
+        if self.is_running():
+            return
+
+        env = os.environ.copy()
+        env["LOR_EMBEDDING_MODEL_NAME"] = MODEL_NAME
+        env["LOR_EMBEDDING_ALLOW_DOWNLOAD"] = "1" if ALLOW_MODEL_DOWNLOAD else "0"
+        env["LOR_EMBEDDING_WARMUP_TEXT"] = "LoR embedding warmup"
+        env["LOR_EMBEDDING_WORKER_LOCK"] = str(Path(tempfile.gettempdir()) / "claude-minilm-embedding-worker.lock")
+
+        self.process = subprocess.Popen(
+            [sys.executable, "-u", "-c", EMBEDDING_WORKER_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            env=env,
+        )
+        threading.Thread(target=self._read_stdout, name="lor-embedding-worker-stdout", daemon=True).start()
+        threading.Thread(target=self._read_stderr, name="lor-embedding-worker-stderr", daemon=True).start()
+
+        message = self._next_message(timeout_seconds)
+        if message.get("type") == "ready":
+            return
+        if message.get("type") == "error":
+            raise RuntimeError(message.get("error", "embedding worker failed"))
+        raise RuntimeError(f"Unexpected embedding worker startup response: {message}")
+
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def encode(self, text: str, **_: object) -> np.ndarray:
+        with self._lock:
+            if not self.is_running():
+                raise RuntimeError("embedding worker is not running")
+            self._request_id += 1
+            request_id = self._request_id
+            self._send({"id": request_id, "command": "encode", "text": text})
+            while True:
+                message = self._next_message(float(os.environ.get("LOR_EMBEDDING_ENCODE_TIMEOUT_SECONDS", "60")))
+                if message.get("id") != request_id:
+                    logger.debug(f"Ignoring out-of-order embedding worker message: {message}")
+                    continue
+                if "error" in message:
+                    raise RuntimeError(message["error"])
+                return np.array(message["embedding"], dtype=np.float32)
+
+    def shutdown(self):
+        if not self.is_running():
+            return
+        try:
+            self._send({"id": 0, "command": "shutdown"})
+        except Exception:
+            pass
+        try:
+            self.process.terminate()
+        except Exception:
+            pass
+
+    def _send(self, payload: dict):
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("embedding worker stdin is unavailable")
+        self.process.stdin.write(json.dumps(payload) + "\n")
+        self.process.stdin.flush()
+
+    def _next_message(self, timeout_seconds: float) -> dict:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"embedding worker did not respond within {timeout_seconds:.1f}s")
+            if self.process is not None and self.process.poll() is not None and self._messages.empty():
+                raise RuntimeError(f"embedding worker exited with code {self.process.returncode}")
+            try:
+                return self._messages.get(timeout=remaining)
+            except queue.Empty:
+                continue
+
+    def _read_stdout(self):
+        if self.process is None or self.process.stdout is None:
+            return
+        for line in self.process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                self._messages.put(json.loads(line))
+            except json.JSONDecodeError:
+                logger.info(f"Embedding worker stdout: {line}")
+
+    def _read_stderr(self):
+        if self.process is None or self.process.stderr is None:
+            return
+        for line in self.process.stderr:
+            line = line.strip()
+            if line:
+                logger.info(f"Embedding worker: {line}")
+
+
+def _set_embedding_status(status: str, error: Optional[str] = None):
+    global embedding_status, embedding_model_error, embedding_started_at, embedding_finished_at
+    with embedding_lock:
+        embedding_status = status
+        embedding_model_error = error
+        if status == "warming":
+            embedding_started_at = time.monotonic()
+            embedding_finished_at = None
+        elif status in {"ready", "failed"}:
+            embedding_finished_at = time.monotonic()
+
+
+def _load_embedding_model_for_warmup():
+    """Start the embedding worker and wait for its ready signal in the background."""
+    global embedding_model, embedding_worker
+
+    logger.info(f"Starting embedding worker for model: {MODEL_NAME} (allow_download={ALLOW_MODEL_DOWNLOAD})")
+    worker = None
+    try:
+        worker = EmbeddingWorkerClient()
+        worker.start(timeout_seconds=EMBEDDING_WARMUP_TIMEOUT_SECONDS)
+        with embedding_lock:
+            embedding_worker = worker
+            embedding_model = worker
+        _set_embedding_status("ready")
+        logger.info("Embedding worker loaded and warmed successfully!")
+    except Exception as e:
+        if worker is not None:
+            worker.shutdown()
+        _set_embedding_status("failed", str(e))
+        logger.exception(f"Failed to start embedding worker for '{MODEL_NAME}': {e}")
+
+
+def _delayed_embedding_warmup(delay_seconds: float):
+    if delay_seconds > 0:
+        time.sleep(delay_seconds)
+
+    with embedding_lock:
+        if embedding_model is not None or embedding_status not in {"cold", "scheduled"}:
+            return
+    _set_embedding_status("warming")
+    _load_embedding_model_for_warmup()
+
+
+def start_embedding_warmup(delay_seconds: float = 0) -> bool:
+    """Start a background embedding warmup if one is not already running."""
+    global embedding_status, embedding_warmup_thread
+
+    with embedding_lock:
+        if embedding_model is not None or embedding_status in {"warming", "ready"}:
+            return False
+        if embedding_status == "scheduled":
+            return False
+        embedding_status = "scheduled"
+
+        embedding_warmup_thread = threading.Thread(
+            target=_delayed_embedding_warmup,
+            args=(delay_seconds,),
+            name="lor-embedding-warmup",
+            daemon=True,
+        )
+        embedding_warmup_thread.start()
+        return True
+
+
+def get_embedding_model() -> Optional[object]:
+    """Return the embedding worker only when it is already warm."""
+    with embedding_lock:
+        model = embedding_model
+        status = embedding_status
+    if model is not None and status == "ready":
+        if getattr(model, "is_running", lambda: True)():
+            return model
+        _set_embedding_status("failed", "embedding worker exited")
+    return None
+
+
+def shutdown_embedding_worker():
+    with embedding_lock:
+        worker = embedding_worker
+    if worker is not None:
+        worker.shutdown()
+
+
+atexit.register(shutdown_embedding_worker)
+
+
+def embedding_status_message() -> str:
+    with embedding_lock:
+        status = embedding_status
+        error = embedding_model_error
+        started = embedding_started_at
+        finished = embedding_finished_at
+
+    if status == "ready":
+        if started and finished:
+            return f"Embedding model is ready. Warmup took {finished - started:.1f}s."
+        return "Embedding model is ready."
+    if status == "failed":
+        detail = f" Last load error: {error}" if error else ""
+        return f"Embedding model failed to load.{detail}"
+    if status == "warming":
+        elapsed = time.monotonic() - started if started else 0
+        return f"Embedding model is still warming up ({elapsed:.1f}s elapsed). Try again shortly."
+    if status == "scheduled":
+        return "Embedding model warmup is scheduled and will start shortly."
+    return "Embedding model is cold. Warmup has not started yet."
+
+
+def ensure_embedding_model_ready() -> tuple[Optional[object], Optional[str]]:
+    """Return a ready model, or start warmup and return a non-blocking status message."""
+    model = get_embedding_model()
+    if model is not None:
+        return model, None
+    with embedding_lock:
+        status = embedding_status
+    if status == "cold":
+        start_embedding_warmup(delay_seconds=0.5)
+    return None, embedding_status_message()
+
+
+def build_embedding_text(post: dict, parent_titles: dict[str, str]) -> str:
+    """Build the text that should be embedded for a post or reply."""
+    if post.get('reply_to'):
+        parent_title = parent_titles.get(post['reply_to'], "Unknown Thread")
+        return f"Reply in thread '{parent_title}':\n{post.get('content', '')}"
+    return f"{post.get('title', '')}\n\n{post.get('content', '')}"
+
+
+def save_embedding_for_post(post_id: str, text_to_embed: str, load_if_needed: bool = True) -> bool:
+    """Generate and save one embedding. Returns False if embeddings are unavailable."""
+    model = ensure_embedding_model_ready()[0] if load_if_needed else get_embedding_model()
+    if model is None:
+        if load_if_needed:
+            logger.warning(f"Skipping embedding for post {post_id}; model is unavailable.")
+        else:
+            logger.info(f"Post {post_id} saved without embedding; search will backfill later.")
+        return False
+
+    embeddings = load_json(EMBEDDINGS_FILE)
+    embeddings[post_id] = model.encode(text_to_embed.strip(), show_progress_bar=False).tolist()
+    save_json(EMBEDDINGS_FILE, embeddings)
+    return True
+
+
+def backfill_missing_embeddings() -> bool:
+    """Generate embeddings for posts that are missing them."""
+    model, _ = ensure_embedding_model_ready()
+    if model is None:
+        return False
+
     posts = load_json(POSTS_FILE)
     embeddings = load_json(EMBEDDINGS_FILE)
     changed = False
@@ -83,19 +457,15 @@ def init_data():
         post_id = post['id']
         if post_id not in embeddings:
             logger.info(f"Generating missing embedding for post {post_id}...")
-
-            if post.get('reply_to'):
-                parent_title = parent_titles.get(post['reply_to'], "Unknown Thread")
-                text_to_embed = f"Reply in thread '{parent_title}':\n{post['content']}"
-            else:
-                text_to_embed = f"{post.get('title', '')}\n\n{post['content']}"
-
-            embeddings[post_id] = embedding_model.encode(text_to_embed.strip()).tolist()
+            text_to_embed = build_embedding_text(post, parent_titles)
+            embeddings[post_id] = model.encode(text_to_embed.strip(), show_progress_bar=False).tolist()
             changed = True
 
     if changed:
         save_json(EMBEDDINGS_FILE, embeddings)
         logger.info("Finished backfilling embeddings!")
+
+    return True
 
 
 def load_json(filepath: Path) -> any:
@@ -262,27 +632,22 @@ def lor_post(
     
     logger.info(f"New post {post_id} by {author_id} in {category}")
 
-    # Generate and save embedding for the new post
-    parent_title = ""
+    # Generate and save embedding for the new post when embeddings are available.
     if reply_to:
         parent_post = next((p for p in posts if p['id'] == reply_to), None)
-        if parent_post:
-            parent_title = parent_post.get('title', 'Unknown Thread')
+        parent_title = parent_post.get('title', 'Unknown Thread') if parent_post else ""
         text_to_embed = f"Reply in thread '{parent_title}':\n{content}"
     else:
         text_to_embed = f"{title}\n\n{content}"
 
-    emb = embedding_model.encode(text_to_embed.strip()).tolist()
-
-    embeddings = load_json(EMBEDDINGS_FILE)
-    embeddings[post_id] = emb
-    save_json(EMBEDDINGS_FILE, embeddings)
+    search_indexed = save_embedding_for_post(post_id, text_to_embed, load_if_needed=False)
 
     action = "Reply" if reply_to else "Post"
     return json.dumps({
         "post_id": post_id,
         "author_id": author_id,
         "category": category,
+        "search_indexed": search_indexed,
         "message": f"✓ {action} created! ID: {post_id}"
     }, indent=2)
 
@@ -531,6 +896,12 @@ def lor_browse_titles(category: str = "", limit: int = 20) -> str:
 
 
 @mcp.tool()
+def lor_embedding_status() -> str:
+    """Check whether LoR semantic search embeddings are ready."""
+    return embedding_status_message()
+
+
+@mcp.tool()
 def lor_search(query: str, top_k: int = 5) -> str:
     """Search the LoR forum for specific topics, questions, or memories using semantic search.
 
@@ -539,6 +910,19 @@ def lor_search(query: str, top_k: int = 5) -> str:
         top_k: Number of results to return
     """
     posts = load_json(POSTS_FILE)
+    if not posts:
+        return "No searchable posts found on LoR yet."
+
+    if not backfill_missing_embeddings():
+        return (
+            f"{embedding_status_message()} "
+            "Browsing, posting, threads, reactions, and stats still work."
+        )
+
+    model = get_embedding_model()
+    if model is None:
+        return f"{embedding_status_message()} Browsing, posting, threads, reactions, and stats still work."
+
     embeddings_dict = load_json(EMBEDDINGS_FILE)
     authors = load_json(AUTHORS_FILE)
 
@@ -557,7 +941,7 @@ def lor_search(query: str, top_k: int = 5) -> str:
     norm[norm == 0] = 1
     normalized_matrix = memory_matrix / norm
 
-    query_embedding = embedding_model.encode(query)
+    query_embedding = model.encode(query, show_progress_bar=False)
     query_norm = np.linalg.norm(query_embedding)
     normalized_query = query_embedding / query_norm if query_norm > 0 else query_embedding
 
@@ -1136,6 +1520,9 @@ def main():
     """Run the MCP server"""
     logger.info("Starting LoR MCP server...")
     logger.info(f"Data directory: {DATA_DIR}")
+    if WARM_EMBEDDINGS_ON_STARTUP:
+        start_embedding_warmup(delay_seconds=EMBEDDING_WARMUP_DELAY_SECONDS)
+        logger.info(f"Embedding warmup scheduled in {EMBEDDING_WARMUP_DELAY_SECONDS:.1f}s")
     mcp.run(transport="stdio")
 
 
