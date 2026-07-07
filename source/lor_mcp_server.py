@@ -54,6 +54,13 @@ ALLOW_MODEL_DOWNLOAD = os.environ.get("LOR_ALLOW_MODEL_DOWNLOAD", "").lower() in
 WARM_EMBEDDINGS_ON_STARTUP = os.environ.get("LOR_WARM_EMBEDDINGS_ON_STARTUP", "1").lower() not in {"0", "false", "no", "off"}
 EMBEDDING_WARMUP_DELAY_SECONDS = float(os.environ.get("LOR_EMBEDDING_WARMUP_DELAY_SECONDS", "10"))
 EMBEDDING_WARMUP_TIMEOUT_SECONDS = float(os.environ.get("LOR_EMBEDDING_WARMUP_TIMEOUT_SECONDS", "120"))
+# Idle timeout: unload the embedding worker (and its ~3 GB of committed memory)
+# when no embedding request has arrived for this long. 0 or negative disables.
+EMBEDDING_IDLE_TIMEOUT_SECONDS = float(os.environ.get("LOR_EMBEDDING_IDLE_TIMEOUT_SECONDS", "900"))
+EMBEDDING_IDLE_CHECK_INTERVAL_SECONDS = float(os.environ.get("LOR_EMBEDDING_IDLE_CHECK_INTERVAL_SECONDS", "30"))
+# After an idle unload, how long a request may wait for the worker to reload
+# before falling back to the non-blocking "warming up" message.
+EMBEDDING_RELOAD_WAIT_SECONDS = float(os.environ.get("LOR_EMBEDDING_RELOAD_WAIT_SECONDS", "60"))
 embedding_model: Optional[object] = None
 embedding_worker: Optional[object] = None
 embedding_model_error: Optional[str] = None
@@ -62,6 +69,9 @@ embedding_started_at: Optional[float] = None
 embedding_finished_at: Optional[float] = None
 embedding_lock = threading.Lock()
 embedding_warmup_thread: Optional[threading.Thread] = None
+# True after an idle unload; lets requests know a reload is quick (model cache
+# is warm) so they may block briefly for it instead of returning a status message.
+embedding_idle_unloaded = False
 
 # Default categories
 DEFAULT_CATEGORIES = [
@@ -193,6 +203,7 @@ class EmbeddingWorkerClient:
         self._messages: queue.Queue[dict] = queue.Queue()
         self._request_id = 0
         self._lock = threading.Lock()
+        self.last_used = time.monotonic()
 
     def start(self, timeout_seconds: float):
         if self.is_running():
@@ -229,6 +240,7 @@ class EmbeddingWorkerClient:
 
     def encode(self, text: str, **_: object) -> np.ndarray:
         with self._lock:
+            self.last_used = time.monotonic()
             if not self.is_running():
                 raise RuntimeError("embedding worker is not running")
             self._request_id += 1
@@ -239,11 +251,31 @@ class EmbeddingWorkerClient:
                 if message.get("id") != request_id:
                     logger.debug(f"Ignoring out-of-order embedding worker message: {message}")
                     continue
+                self.last_used = time.monotonic()
                 if "error" in message:
                     raise RuntimeError(message["error"])
                 return np.array(message["embedding"], dtype=np.float32)
 
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self.last_used
+
     def shutdown(self):
+        with self._lock:
+            self._shutdown_locked()
+
+    def shutdown_if_idle(self, idle_timeout_seconds: float) -> bool:
+        """Shut down the worker if it has been idle long enough. Returns True on shutdown.
+
+        Takes the request lock, so it never kills an encode that is in flight;
+        the idle check is re-done under the lock to avoid racing a fresh request.
+        """
+        with self._lock:
+            if self.idle_seconds() < idle_timeout_seconds:
+                return False
+            self._shutdown_locked()
+            return True
+
+    def _shutdown_locked(self):
         if not self.is_running():
             return
         try:
@@ -309,23 +341,69 @@ def _set_embedding_status(status: str, error: Optional[str] = None):
 
 def _load_embedding_model_for_warmup():
     """Start the embedding worker and wait for its ready signal in the background."""
-    global embedding_model, embedding_worker
+    global embedding_model, embedding_worker, embedding_idle_unloaded
 
     logger.info(f"Starting embedding worker for model: {MODEL_NAME} (allow_download={ALLOW_MODEL_DOWNLOAD})")
     worker = None
     try:
         worker = EmbeddingWorkerClient()
         worker.start(timeout_seconds=EMBEDDING_WARMUP_TIMEOUT_SECONDS)
+        worker.last_used = time.monotonic()
         with embedding_lock:
             embedding_worker = worker
             embedding_model = worker
+            embedding_idle_unloaded = False
         _set_embedding_status("ready")
         logger.info("Embedding worker loaded and warmed successfully!")
+        _start_embedding_idle_monitor(worker)
     except Exception as e:
         if worker is not None:
             worker.shutdown()
+        with embedding_lock:
+            embedding_idle_unloaded = False
         _set_embedding_status("failed", str(e))
         logger.exception(f"Failed to start embedding worker for '{MODEL_NAME}': {e}")
+
+
+def _embedding_idle_monitor(worker: EmbeddingWorkerClient):
+    """Unload the embedding worker after a period with no embedding requests.
+
+    Bound to one worker instance; exits once that worker is unloaded, dies,
+    or is replaced. A fresh monitor is started with each new worker.
+    """
+    global embedding_model, embedding_worker, embedding_idle_unloaded
+
+    interval = max(1.0, min(EMBEDDING_IDLE_CHECK_INTERVAL_SECONDS, EMBEDDING_IDLE_TIMEOUT_SECONDS))
+    while True:
+        time.sleep(interval)
+        with embedding_lock:
+            if embedding_worker is not worker:
+                return
+        if not worker.is_running():
+            return
+        if worker.shutdown_if_idle(EMBEDDING_IDLE_TIMEOUT_SECONDS):
+            with embedding_lock:
+                if embedding_worker is worker:
+                    embedding_worker = None
+                    embedding_model = None
+                    embedding_idle_unloaded = True
+            _set_embedding_status("idle")
+            logger.info(
+                f"Embedding worker unloaded after {EMBEDDING_IDLE_TIMEOUT_SECONDS:.0f}s of inactivity; "
+                "it will reload on the next embedding request."
+            )
+            return
+
+
+def _start_embedding_idle_monitor(worker: EmbeddingWorkerClient):
+    if EMBEDDING_IDLE_TIMEOUT_SECONDS <= 0:
+        return
+    threading.Thread(
+        target=_embedding_idle_monitor,
+        args=(worker,),
+        name="lor-embedding-idle-monitor",
+        daemon=True,
+    ).start()
 
 
 def _delayed_embedding_warmup(delay_seconds: float):
@@ -401,18 +479,43 @@ def embedding_status_message() -> str:
         return f"Embedding model is still warming up ({elapsed:.1f}s elapsed). Try again shortly."
     if status == "scheduled":
         return "Embedding model warmup is scheduled and will start shortly."
+    if status == "idle":
+        return "Embedding model was unloaded after inactivity. It will reload on the next search — try again shortly."
     return "Embedding model is cold. Warmup has not started yet."
 
 
+def _wait_for_embedding_model(timeout_seconds: float) -> Optional[object]:
+    """Poll for the embedding worker to become ready, up to timeout_seconds."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        model = get_embedding_model()
+        if model is not None:
+            return model
+        with embedding_lock:
+            if embedding_status == "failed":
+                return None
+        time.sleep(0.25)
+    return None
+
+
 def ensure_embedding_model_ready() -> tuple[Optional[object], Optional[str]]:
-    """Return a ready model, or start warmup and return a non-blocking status message."""
+    """Return a ready model, or start warmup and return a non-blocking status message.
+
+    Exception: after an idle unload the model cache on disk is warm, so a reload
+    is quick — in that case block briefly for it instead of bouncing the request.
+    """
     model = get_embedding_model()
     if model is not None:
         return model, None
     with embedding_lock:
         status = embedding_status
-    if status == "cold":
-        start_embedding_warmup(delay_seconds=0.5)
+        idle_reload = embedding_idle_unloaded
+    if status in {"cold", "idle"}:
+        start_embedding_warmup(delay_seconds=0 if status == "idle" else 0.5)
+    if idle_reload and EMBEDDING_RELOAD_WAIT_SECONDS > 0:
+        model = _wait_for_embedding_model(EMBEDDING_RELOAD_WAIT_SECONDS)
+        if model is not None:
+            return model, None
     return None, embedding_status_message()
 
 

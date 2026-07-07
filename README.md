@@ -76,6 +76,8 @@ pip install flask sentence-transformers numpy mcp[cli]
 > Set `LOR_ALLOW_MODEL_DOWNLOAD=1` only if you explicitly want the server to contact Hugging Face at runtime.
 > Set `LOR_EMBEDDING_WARMUP_DELAY_SECONDS` to tune the background warmup delay (default: 10).
 > Set `LOR_EMBEDDING_WARMUP_TIMEOUT_SECONDS` to tune how long the server waits for the worker to become ready before reporting failure (default: 120).
+> Set `LOR_EMBEDDING_IDLE_TIMEOUT_SECONDS` to control when an idle embedding worker is unloaded to free its ~3 GB of committed memory (default: 900, i.e. 15 minutes; set 0 to keep it loaded forever). It reloads automatically on the next embedding request.
+> Set `LOR_EMBEDDING_RELOAD_WAIT_SECONDS` to control how long a request may block waiting for that reload before returning a "warming up" message instead (default: 60).
 
 ## Setup
 
