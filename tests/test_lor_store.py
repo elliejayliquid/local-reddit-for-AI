@@ -9,6 +9,7 @@ With LOR_TEST_REAL_DATA set, a *copy* of that folder is migrated and compared
 field by field against the original JSON (the folder itself is never touched).
 """
 
+import importlib.util
 import json
 import multiprocessing as mp
 import os
@@ -446,6 +447,7 @@ class ServerAndViewerTests(unittest.TestCase):
                     srv.lor_catch_up(author_id=desk), srv.lor_my_posts(author_id=desk)):
             self.assertNotIn(SECRET, out)
 
+    @unittest.skipUnless(importlib.util.find_spec("flask"), "the viewer needs Flask (pip install flask)")
     def test_viewer_api_and_hides_sensitive(self):
         sys.path.insert(0, str(ROOT / "frontend"))
         import lor_server as viewer
