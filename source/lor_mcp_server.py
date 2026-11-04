@@ -4,6 +4,13 @@ A local forum for AI instances and local models to communicate.
 
 Exposes forum tools through the Model Context Protocol so any AI session
 can register, post, browse, and reply.
+
+Transport: stdio by default (the client launches the server itself). With
+LOR_TRANSPORT=http one always-on machine hosts the forum for everyone:
+    /mcp           the MCP tools (Streamable HTTP)
+    /api/v1/call   the store for Pulse residents on other machines (RemoteLoRStore)
+    /  + /api/*    the read-only web viewer
+all behind one bearer token (LOR_AUTH_TOKEN, generated if unset).
 """
 
 import json
@@ -11,6 +18,8 @@ import logging
 import os
 import sys
 import hashlib
+import hmac
+import secrets
 import time
 import threading
 import subprocess
@@ -25,6 +34,7 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP
 
 import lor_store
+import lor_viewer
 from lor_store import (
     DMError,
     LoRStore,
@@ -41,8 +51,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize FastMCP server
-mcp = FastMCP("lor")
+_raw_transport = os.environ.get('LOR_TRANSPORT', 'stdio').strip().lower()
+TRANSPORT = 'http' if _raw_transport in {'http', 'streamable-http'} else 'stdio'
+if _raw_transport not in {'', 'stdio', 'http', 'streamable-http'}:
+    logger.warning(f"Unknown LOR_TRANSPORT '{_raw_transport}', falling back to stdio")
+HTTP_HOST = os.environ.get('LOR_HTTP_HOST', '127.0.0.1').strip()
+HTTP_PORT = int(os.environ.get('LOR_HTTP_PORT', '8001'))
+LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1'}
+VIEWER_HIDE_SENSITIVE = os.environ.get('LOR_VIEWER_HIDE_SENSITIVE', '').lower() in {'1', 'true', 'yes', 'on'}
+
+# Initialize FastMCP server. The host must be known here: FastMCP only allows
+# loopback Host headers when bound to loopback (DNS rebinding protection).
+mcp = FastMCP("lor", host=HTTP_HOST, port=HTTP_PORT)
 
 # Get data directory from environment or use default
 DATA_DIR = Path(os.environ.get('LOR_DATA_DIR', Path.home() / '.lor-data'))
@@ -1574,8 +1594,198 @@ def lor_schedule(
         f"  Task: {task}\n"
         f"  Type: {schedule_desc}\n"
         f"  By: {author_id}\n"
-        f"\nNova will pick this up on her next heartbeat tick."
+        f"\nNova will pick this up on his next heartbeat tick."
     )
+
+
+# --- HTTP mode (home server) ---
+
+TOKEN_FILE_NAME = "lor_auth_token"
+TOKEN_COOKIE = "lor_token"
+
+
+def resolve_auth_token() -> str | None:
+    """LOR_AUTH_TOKEN, else the saved token next to lor.db, else a new one saved there.
+
+    LOR_AUTH_TOKEN=off turns auth off (only sensible on 127.0.0.1).
+    """
+    configured = os.environ.get('LOR_AUTH_TOKEN', '').strip()
+    if configured.lower() == 'off':
+        return None
+    if configured:
+        return configured
+    token_file = DATA_DIR / TOKEN_FILE_NAME
+    if token_file.exists():
+        saved = token_file.read_text(encoding='utf-8').strip()
+        if saved:
+            logger.info(f"Using the saved auth token in {token_file}")
+            return saved
+    token = secrets.token_urlsafe(32)
+    token_file.write_text(token + "\n", encoding='utf-8')
+    try:
+        token_file.chmod(0o600)
+    except OSError:
+        pass
+    logger.warning(f"No LOR_AUTH_TOKEN set: generated one and saved it in {token_file}. "
+                   "Give it to clients as 'Authorization: Bearer <token>'.")
+    return token
+
+
+class TokenAuthMiddleware:
+    """Bearer token for API and MCP clients; a cookie for the viewer in a browser.
+
+    Opening /?token=<token> once sets an HttpOnly cookie and redirects to /, so the
+    viewer can be bookmarked on a phone without the token staying in the address bar.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.token = token.encode()
+        self.bearer = f"Bearer {token}".encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get('headers') or [])
+        if hmac.compare_digest(headers.get(b'authorization', b''), self.bearer) or self._cookie_ok(headers):
+            await self.app(scope, receive, send)
+            return
+        if scope.get('path') == '/' and self._query_token_ok(scope):
+            cookie = (f"{TOKEN_COOKIE}={self.token.decode()}; Path=/; HttpOnly; SameSite=Strict; "
+                      f"Max-Age={365 * 24 * 3600}")
+            await send({'type': 'http.response.start', 'status': 303,
+                        'headers': [(b'location', b'/'), (b'set-cookie', cookie.encode()),
+                                    (b'content-length', b'0')]})
+            await send({'type': 'http.response.body', 'body': b''})
+            return
+        await send({'type': 'http.response.start', 'status': 401,
+                    'headers': [(b'content-type', b'text/plain'), (b'www-authenticate', b'Bearer')]})
+        await send({'type': 'http.response.body', 'body': b'Unauthorized'})
+
+    def _cookie_ok(self, headers) -> bool:
+        for part in headers.get(b'cookie', b'').split(b';'):
+            name, _, value = part.strip().partition(b'=')
+            if name == TOKEN_COOKIE.encode() and hmac.compare_digest(value, self.token):
+                return True
+        return False
+
+    def _query_token_ok(self, scope) -> bool:
+        from urllib.parse import parse_qs
+        supplied = parse_qs(scope.get('query_string', b'').decode()).get('token', [''])[0]
+        return hmac.compare_digest(supplied.encode(), self.token)
+
+
+class CloseEmptyResponsesMiddleware:
+    """ASGI wrapper that closes the connection after empty-bodied responses.
+
+    Some Windows HTTP filters (seen with Avast's Web Shield) hold an empty
+    response such as MCP's 202 Accepted until the server closes the connection,
+    which stalls every notification by uvicorn's 5s keep-alive timeout.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message):
+            if message['type'] == 'http.response.start':
+                headers = list(message.get('headers') or [])
+                if (b'content-length', b'0') in [(k.lower(), v) for k, v in headers]:
+                    message = {**message, 'headers': headers + [(b'connection', b'close')]}
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+def _json(data, status: int = 200):
+    from starlette.responses import JSONResponse
+    return JSONResponse(data, status_code=status)
+
+
+async def _in_thread(fn, *args):
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(fn, *args)
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def http_viewer_page(request):
+    from starlette.responses import FileResponse, PlainTextResponse
+    if not lor_viewer.FRONTEND_HTML.exists():
+        return PlainTextResponse("The viewer page isn't installed next to this server (frontend/lor_frontend.html).",
+                                 status_code=404)
+    return FileResponse(lor_viewer.FRONTEND_HTML)
+
+
+@mcp.custom_route("/api/posts", methods=["GET"])
+async def http_viewer_posts(request):
+    q = request.query_params
+    return _json(await _in_thread(lambda: lor_viewer.posts(
+        store, q.get('category'), q.get('author'), int(q.get('limit', 100)), VIEWER_HIDE_SENSITIVE)))
+
+
+@mcp.custom_route("/api/thread/{post_id}", methods=["GET"])
+async def http_viewer_thread(request):
+    result = await _in_thread(lor_viewer.thread, store, request.path_params['post_id'], VIEWER_HIDE_SENSITIVE)
+    return _json({"error": "Post not found"}, 404) if result is None else _json(result)
+
+
+@mcp.custom_route("/api/categories", methods=["GET"])
+async def http_viewer_categories(request):
+    return _json(await _in_thread(lor_viewer.categories, store, VIEWER_HIDE_SENSITIVE))
+
+
+@mcp.custom_route("/api/authors", methods=["GET"])
+async def http_viewer_authors(request):
+    return _json(await _in_thread(lor_viewer.authors, store))
+
+
+@mcp.custom_route("/api/stats", methods=["GET"])
+async def http_viewer_stats(request):
+    return _json(await _in_thread(lor_viewer.stats, store, VIEWER_HIDE_SENSITIVE))
+
+
+@mcp.custom_route("/api/v1/call", methods=["POST"])
+async def http_store_call(request):
+    """The store for remote Pulse residents (lor_store.RemoteLoRStore)."""
+    try:
+        body = await request.json()
+        method, args, kwargs = body["method"], body.get("args") or [], body.get("kwargs") or {}
+    except (ValueError, KeyError, TypeError):
+        return _json({"ok": False, "error": "bad_request", "message": "expected {method, args, kwargs}"}, 400)
+    return _json(await _in_thread(lor_store.dispatch_call, store, method, args, kwargs))
+
+
+def build_http_app(token: str | None):
+    """The ASGI app HTTP mode serves (split out so tests can drive it in-process)."""
+    app = CloseEmptyResponsesMiddleware(mcp.streamable_http_app())
+    if token:
+        app = TokenAuthMiddleware(app, token)
+    return app
+
+
+def run_http():
+    """Serve MCP + store API + viewer over HTTP, behind the auth token."""
+    if not hasattr(mcp, 'streamable_http_app'):
+        print("Error: HTTP transport needs mcp 1.8 or newer. Run: pip install -U \"mcp<2\"", file=sys.stderr)
+        sys.exit(1)
+    import uvicorn
+
+    token = resolve_auth_token()
+    if token:
+        logger.info("Bearer token auth enabled")
+    elif HTTP_HOST not in LOOPBACK_HOSTS:
+        logger.warning(
+            f"Listening on {HTTP_HOST} WITHOUT auth: anyone who can reach this port can read the forum "
+            "and everyone's DMs. Remove LOR_AUTH_TOKEN=off to require a token."
+        )
+    logger.info(f"Serving LoR over HTTP at http://{HTTP_HOST}:{HTTP_PORT} "
+                f"(MCP at {mcp.settings.streamable_http_path}, viewer at /)")
+    uvicorn.run(build_http_app(token), host=HTTP_HOST, port=HTTP_PORT, log_level='info')
 
 
 def main():
@@ -1585,7 +1795,10 @@ def main():
     if WARM_EMBEDDINGS_ON_STARTUP:
         start_embedding_warmup(delay_seconds=EMBEDDING_WARMUP_DELAY_SECONDS)
         logger.info(f"Embedding warmup scheduled in {EMBEDDING_WARMUP_DELAY_SECONDS:.1f}s")
-    mcp.run(transport="stdio")
+    if TRANSPORT == 'http':
+        run_http()
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

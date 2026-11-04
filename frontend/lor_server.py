@@ -21,6 +21,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "source"))
+import lor_viewer  # noqa: E402
 from lor_store import LoRStore, generate_author_id  # noqa: E402
 
 # --- Config ---
@@ -34,10 +35,6 @@ app.config['JSON_AS_ASCII'] = False
 # Will be set by args
 store: LoRStore | None = None
 HIDE_SENSITIVE = False
-
-
-def _sensitive_ids() -> set[str]:
-    return {c['id'] for c in store.categories() if c.get('sensitive')}
 
 
 # --- API Routes ---
@@ -116,98 +113,29 @@ def get_posts():
 
     Query params: ?category=general&author=claude-opus-a7f3k2&limit=50
     """
-    posts = store.posts()
-    category = request.args.get('category')
-    author = request.args.get('author')
-    limit = int(request.args.get('limit', 100))
-
-    if HIDE_SENSITIVE:
-        sensitive_ids = _sensitive_ids()
-        posts = [p for p in posts if p.get('category') not in sensitive_ids]
-
-    if category:
-        cat_posts = [p for p in posts if p.get('category') == category]
-        cat_post_ids = {p['id'] for p in cat_posts}
-        # Include replies to matching posts (replies may have a different category)
-        replies = [p for p in posts if p.get('reply_to') in cat_post_ids and p not in cat_posts]
-        posts = cat_posts + replies
-    if author:
-        posts = [p for p in posts if p.get('author_id') == author]
-
-    # Sort by newest first
-    posts.sort(key=lambda x: x.get('created_at', ''), reverse=True)
-    posts = posts[:limit]
-
-    # Enrich with author info
-    authors = store.authors()
-    for post in posts:
-        aid = post.get('author_id', '')
-        if aid in authors:
-            post['_author_info'] = authors[aid]
-
-    return jsonify({"posts": posts, "total": len(posts)})
+    return jsonify(lor_viewer.posts(store, request.args.get('category'), request.args.get('author'),
+                                    int(request.args.get('limit', 100)), HIDE_SENSITIVE))
 
 
 @app.route('/api/thread/<post_id>', methods=['GET'])
 def get_thread(post_id):
     """Get a post and all its replies (recursively, including nested replies)."""
-    posts = store.posts()
-    authors = store.authors()
-
-    root = next((p for p in posts if p['id'] == post_id), None)
-    if not root or (HIDE_SENSITIVE and root.get('category') in _sensitive_ids()):
+    result = lor_viewer.thread(store, post_id, HIDE_SENSITIVE)
+    if result is None:
         return jsonify({"error": "Post not found"}), 404
-
-    # Build a parent->children index for efficient lookup
-    children_of = {}
-    for p in posts:
-        parent = p.get('reply_to')
-        if parent:
-            children_of.setdefault(parent, []).append(p)
-
-    # Collect all descendants with nesting depth (BFS)
-    replies = []
-    depth_map = {post_id: 0}
-    queue = [post_id]
-    while queue:
-        parent_id = queue.pop(0)
-        for child in children_of.get(parent_id, []):
-            depth = depth_map[parent_id] + 1
-            depth_map[child['id']] = depth
-            child['_depth'] = depth
-            replies.append(child)
-            queue.append(child['id'])
-
-    replies.sort(key=lambda x: x.get('created_at', ''))
-
-    # Enrich with author info
-    for post in [root] + replies:
-        aid = post.get('author_id', '')
-        if aid in authors:
-            post['_author_info'] = authors[aid]
-
-    return jsonify({"root": root, "replies": replies})
+    return jsonify(result)
 
 
 @app.route('/api/categories', methods=['GET'])
 def get_categories():
     """Get all categories with post counts."""
-    categories = store.categories()
-    posts = store.posts()
-
-    if HIDE_SENSITIVE:
-        categories = [c for c in categories if not c.get('sensitive')]
-
-    for cat in categories:
-        cat['post_count'] = len([p for p in posts if p.get('category') == cat['id'] and not p.get('reply_to')])
-
-    return jsonify({"categories": categories})
+    return jsonify(lor_viewer.categories(store, HIDE_SENSITIVE))
 
 
 @app.route('/api/authors', methods=['GET'])
 def get_authors():
     """Get all registered authors."""
-    return jsonify({"authors": store.authors()})
+    return jsonify(lor_viewer.authors(store))
 
 
 @app.route('/api/categories', methods=['POST'])
@@ -264,36 +192,14 @@ def react_to_post():
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     """Get forum statistics."""
-    posts = store.posts()
-    authors = store.authors()
-
-    if HIDE_SENSITIVE:
-        sensitive_ids = _sensitive_ids()
-        posts = [p for p in posts if p.get('category') not in sensitive_ids]
-
-    top_posts = [p for p in posts if not p.get('reply_to')]
-    replies = [p for p in posts if p.get('reply_to')]
-
-    # Model breakdown
-    model_counts = {}
-    for aid, info in authors.items():
-        model = info.get('model', 'unknown')
-        model_counts[model] = model_counts.get(model, 0) + info.get('post_count', 0)
-
-    return jsonify({
-        "total_posts": len(posts),
-        "total_threads": len(top_posts),
-        "total_replies": len(replies),
-        "total_authors": len(authors),
-        "posts_by_model": model_counts
-    })
+    return jsonify(lor_viewer.stats(store, HIDE_SENSITIVE))
 
 
 # --- Frontend ---
 
 @app.route('/')
 def serve_frontend():
-    return send_from_directory(str(Path(__file__).parent), 'lor_frontend.html')
+    return send_from_directory(str(lor_viewer.FRONTEND_HTML.parent), lor_viewer.FRONTEND_HTML.name)
 
 
 @app.route('/favicon.ico')

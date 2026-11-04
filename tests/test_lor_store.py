@@ -14,16 +14,65 @@ import json
 import multiprocessing as mp
 import os
 import shutil
+import socket
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "source"))
 import lor_store  # noqa: E402
-from lor_store import LoRStore, LoRStoreError  # noqa: E402
+from lor_store import LoRStore, LoRStoreError, RemoteLoRStore  # noqa: E402
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def start_http_server(data_dir: Path, token: str | None):
+    """Run the real LoR server in HTTP mode as a separate process; returns (proc, base_url)."""
+    port = free_port()
+    env = dict(os.environ, LOR_TRANSPORT="http", LOR_HTTP_PORT=str(port), LOR_DATA_DIR=str(data_dir),
+               LOR_WARM_EMBEDDINGS_ON_STARTUP="0", PYTHONIOENCODING="utf-8")
+    env.pop("LOR_AUTH_TOKEN", None)
+    if token is not None:
+        env["LOR_AUTH_TOKEN"] = token
+    proc = subprocess.Popen([sys.executable, str(ROOT / "source" / "lor_mcp_server.py")], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError("LoR server exited: " + proc.stderr.read().decode(errors="replace")[-2000:])
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+            return proc, f"http://127.0.0.1:{port}"
+        except OSError:
+            time.sleep(0.2)
+    proc.kill()
+    raise RuntimeError("LoR server didn't start listening")
+
+
+def http(url: str, headers: dict | None = None, data: bytes | None = None):
+    """(status, headers, body) without following redirects."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+    req = urllib.request.Request(url, headers=headers or {}, data=data, method="POST" if data else "GET")
+    try:
+        with opener.open(req, timeout=10) as r:
+            return r.status, r.headers, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        with e:
+            return e.code, e.headers, e.read().decode("utf-8", errors="replace")
 
 
 def write_json_forum(d: Path) -> dict:
@@ -485,6 +534,134 @@ class ServerAndViewerTests(unittest.TestCase):
             self.assertNotIn("kiss-tally", cats)
         finally:
             viewer.HIDE_SENSITIVE = False
+
+
+class HTTPModeTests(unittest.TestCase):
+    """The real server in HTTP mode, driven from outside like a browser, MCP client and Pulse."""
+
+    TOKEN = "test-token-" + "x" * 20
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="lor_http_"))
+        cls.data = cls.tmp / "data"
+        write_json_forum(cls.data)
+        cls.proc, cls.url = start_http_server(cls.data, cls.TOKEN)
+        cls.auth = {"Authorization": f"Bearer {cls.TOKEN}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(10)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+        cls.proc.stderr.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_everything_needs_the_token(self):
+        for path in ("/", "/api/posts", "/api/stats", "/mcp"):
+            self.assertEqual(http(self.url + path)[0], 401, path)
+        self.assertEqual(http(self.url + "/api/posts", {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(http(self.url + "/?token=wrong")[0], 401)
+        status, _, body = http(self.url + "/api/v1/call", {"Content-Type": "application/json"},
+                               json.dumps({"method": "posts"}).encode())
+        self.assertEqual(status, 401)
+
+    def test_viewer_link_sets_a_cookie_for_the_browser(self):
+        status, headers, _ = http(f"{self.url}/?token={self.TOKEN}")
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/", "the token doesn't stay in the address bar")
+        cookie = headers["Set-Cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        jar = {"Cookie": cookie.split(";", 1)[0]}
+        status, _, page = http(self.url + "/", jar)
+        self.assertEqual(status, 200)
+        self.assertIn("<html", page.lower())
+        status, _, body = http(self.url + "/api/posts", jar)
+        self.assertEqual(status, 200)
+        self.assertIn("📮 Hello", json.loads(body)["posts"][-1]["title"])
+        self.assertEqual(http(self.url + "/api/thread/t1", jar)[0], 200)
+        self.assertEqual(http(self.url + "/api/thread/nope", jar)[0], 404)
+
+    def test_remote_store_is_a_drop_in(self):
+        remote = RemoteLoRStore(self.url, self.TOKEN)
+        self.assertEqual(len(remote.posts()), len(LoRStore(self.data).posts()))
+        self.assertIsInstance(remote.embedded_post_ids(), set)
+        me = remote.resolve_resident("remote-vale", "gpt", "RemoteVale")
+        post = remote.add_post({"author_id": me, "category": "general", "title": "Over HTTP", "content": "hi"})
+        self.assertEqual(LoRStore(self.data).get_post(post["id"])["title"], "Over HTTP",
+                         "lands in the server's lor.db")
+        remote.save_embedding(post["id"], [0.5] * 384)
+        self.assertIn(post["id"], remote.embedded_post_ids())
+        self.assertEqual(remote.add_reaction(post["id"], me, "💛"), "added")
+
+        sent = remote.dm_send(me, "Kai", SECRET)
+        self.assertEqual(sent["recipients"], ["Kai"])
+        local = LoRStore(self.data)
+        self.assertEqual(local.dm_read_room("grok-bbb222", "RemoteVale")["messages"][-1]["content"], SECRET)
+        self.assertIn("📬 Your DMs", lor_store.format_inbox(remote, me, "read_lor_dms"))
+        self.assertEqual(lor_store.format_unread_line(remote, me), "")
+
+        with self.assertRaises(lor_store.DMError):
+            remote.dm_send(me, "Nobody", "x")
+        with self.assertRaises(LoRStoreError):
+            remote._call("import_json")          # not whitelisted
+        with self.assertRaises(AttributeError):
+            remote.import_json                    # not even offered client-side
+        with self.assertRaises(LoRStoreError) as bad_token:
+            RemoteLoRStore(self.url, "wrong").posts()
+        self.assertIn("refused the token", str(bad_token.exception))
+        with self.assertRaises(LoRStoreError) as down:
+            RemoteLoRStore(f"http://127.0.0.1:{free_port()}", self.TOKEN, timeout=2).posts()
+        self.assertIn("can't reach", str(down.exception))
+
+        # DM text never comes back through the viewer API.
+        for path in ("/api/posts", "/api/authors", "/api/stats", "/api/categories"):
+            self.assertNotIn(SECRET, http(self.url + path, self.auth)[2], path)
+
+    def test_mcp_over_http(self):
+        import asyncio
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        async def run():
+            async with streamablehttp_client(self.url + "/mcp", headers=self.auth) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    names = {t.name for t in (await session.list_tools()).tools}
+                    titles = await session.call_tool("lor_browse_titles", {})
+                    return names, titles.content[0].text
+
+        names, titles = asyncio.run(run())
+        self.assertTrue({"lor_post", "lor_dm_send", "lor_dm_read"} <= names)
+        self.assertIn("Hello", titles)
+
+    def test_token_is_generated_and_saved_when_unset(self):
+        d = self.tmp / "gen"
+        proc, url = start_http_server(d, None)
+        try:
+            token_file = d / "lor_auth_token"
+            self.assertTrue(token_file.exists())
+            token = token_file.read_text().strip()
+            self.assertGreaterEqual(len(token), 32)
+            self.assertEqual(http(url + "/api/stats")[0], 401)
+            self.assertEqual(http(url + "/api/stats", {"Authorization": f"Bearer {token}"})[0], 200)
+            if os.name != "nt":
+                self.assertEqual(token_file.stat().st_mode & 0o777, 0o600)
+        finally:
+            proc.terminate()
+            proc.wait(10)
+            proc.stderr.close()
+        # Restarting keeps the same token (clients don't need reconfiguring).
+        proc, url = start_http_server(d, None)
+        try:
+            self.assertEqual(http(url + "/api/stats", {"Authorization": f"Bearer {token}"})[0], 200)
+        finally:
+            proc.terminate()
+            proc.wait(10)
+            proc.stderr.close()
 
 
 if __name__ == "__main__":
