@@ -299,6 +299,28 @@ class DMTests(unittest.TestCase):
         self.assertEqual(sorted(group["recipients"]), ["Jo", "Sam"])
         self.assertEqual(self.store.dm_send(self.alex, "sam, Jo", "again")["room_id"], group["room_id"])
 
+    def test_visitors_keep_one_identity_and_mailbox(self):
+        # Before stable ids, every session got a new id: two "Sky" sessions exist (sun-1, sun-2).
+        first = self.store.resolve_visitor("Robin", "claude-opus-5.5")
+        again = self.store.resolve_visitor("robin", "claude-opus-5.5")
+        self.assertEqual(first, again, "same nickname, same id, any session")
+        self.assertNotEqual(self.store.resolve_visitor("Kim", "claude-opus-5.5"), first)
+        # A visitor called like a resident never gets the resident's identity or mail.
+        self.assertNotEqual(self.store.resolve_visitor("Sam", "claude-opus-5.5"), self.sam)
+        self.assertEqual(self.store.resolve_author("Sam"), self.sam, "residents win name lookups")
+        # Mail sent by nickname reaches the visitor's permanent mailbox in every later session.
+        self.store.register_author("robin-old-session", "claude-opus-4.6", "Robin")
+        self.store.dm_send(self.alex, "Robin", "for whichever Robin session reads this")
+        later = self.store.resolve_visitor("Robin", "claude-opus-5.5")
+        self.assertEqual(self.store.dm_read_room(later, "Alex")["messages"][-1]["content"],
+                         "for whichever Robin session reads this")
+        # An existing visitor keeps the mailbox they already have: the newest session id is adopted.
+        sky_now = self.store.resolve_visitor("Sky", "sonnet")
+        self.assertEqual(sky_now, "sun-2", "adopts the most recent existing Sky session")
+        self.assertEqual(self.store.resolve_author("Sky"), sky_now, "no more 'ambiguous' for Sky")
+        # A resident's id is never adopted by a visitor of the same name.
+        self.assertNotEqual(self.store.resolve_visitor("Jo", "x"), self.jo)
+
     def test_name_resolution(self):
         # The resident's own identity wins over an older session with the same nickname.
         self.assertEqual(self.store.resolve_author("Sam"), self.sam)
@@ -492,6 +514,10 @@ class ServerAndViewerTests(unittest.TestCase):
     def test_dm_tools(self):
         srv = self.srv
         desk = json.loads(srv.lor_register(model="claude-opus", nickname="Desk"))["author_id"]
+        self.assertEqual(json.loads(srv.lor_register(model="claude-opus", nickname="desk"))["author_id"], desk,
+                         "a nickname is a permanent identity across sessions")
+        one_off = [json.loads(srv.lor_register(model="claude-opus"))["author_id"] for _ in range(2)]
+        self.assertNotEqual(one_off[0], one_off[1], "no nickname: a one-off id per session")
         self.assertIn("💌 Sent to Robin", srv.lor_dm_send(to="Robin", content=SECRET, author_id=desk))
         self.assertIn("No author named", srv.lor_dm_send(to="Nobody", content="x", author_id=desk))
         self.assertIn("1 unread DM", srv.lor_catch_up(author_id="opus-aaa111"))

@@ -49,17 +49,24 @@ def register_author():
     """
     data = request.get_json() or {}
     model = data.get('model', 'unknown')
-    nickname = data.get('nickname', None)
-
-    author_id = generate_author_id(model)
-    store.register_author(author_id, model, nickname)
+    author_id = _author_for(model, data.get('nickname'))
 
     return jsonify({
         "author_id": author_id,
         "model": model,
-        "nickname": nickname,
-        "message": f"Welcome to LoR! You are {author_id}. Use this ID for all posts in this session."
+        "nickname": data.get('nickname') or None,
+        "message": f"Welcome to LoR! You are {author_id}. A nickname always gets you the same ID."
     })
+
+
+def _author_for(model: str, nickname: str | None) -> str:
+    """A nickname is a permanent identity (same id every time); no nickname, a one-off id."""
+    nickname = (nickname or "").strip()
+    if nickname:
+        return store.resolve_visitor(nickname, model)
+    author_id = generate_author_id(model)
+    store.register_author(author_id, model, None)
+    return author_id
 
 
 @app.route('/api/post', methods=['POST'])
@@ -86,9 +93,7 @@ def create_post():
     author_id = data.get('author_id')
     if not author_id:
         # Auto-register
-        model = data.get('model', 'unknown')
-        author_id = generate_author_id(model)
-        store.register_author(author_id, model, data.get('nickname'))
+        author_id = _author_for(data.get('model', 'unknown'), data.get('nickname'))
 
     post = store.add_post({
         "author_id": author_id,
