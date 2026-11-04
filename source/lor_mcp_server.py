@@ -571,21 +571,65 @@ def backfill_missing_embeddings() -> bool:
     return True
 
 
+# Shared-file access: Pulse writes these files too. A torn read (another
+# process mid-write) clears in milliseconds, and Windows blocks a replace
+# while a reader has the file open.
+_READ_RETRIES = 5
+_RETRY_DELAY = 0.05
+_REPLACE_TIMEOUT = 5.0
+
+
+class LoRStorageError(Exception):
+    """A LoR data file couldn't be read or written safely; nothing was changed."""
+
+
 def load_json(filepath: Path) -> any:
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        logger.error(f"Failed to load {filepath}: {e}")
-        return [] if 'posts' in str(filepath) else {}
+    """Read a data file. Missing → empty; unreadable → LoRStorageError.
+
+    Returning empty on a torn read would let the next save overwrite the
+    whole forum, so a file that stays unreadable after a few short retries
+    raises and the tool call fails without writing anything.
+    """
+    last_error = None
+    for attempt in range(_READ_RETRIES):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return [] if 'posts' in str(filepath) else {}
+        except (json.JSONDecodeError, OSError) as e:
+            last_error = e
+            time.sleep(_RETRY_DELAY)
+    logger.error(f"Failed to load {filepath}: {last_error}")
+    raise LoRStorageError(
+        f"LoR is busy right now ({filepath.name} is unreadable). Nothing was changed. Try again in a moment."
+    )
 
 
 def save_json(filepath: Path, data: any):
+    """Write atomically: readers in other processes see the old or new file, never half."""
+    tmp = filepath.with_name(f"{filepath.name}.{os.getpid()}.tmp")
     try:
-        with open(filepath, 'w', encoding='utf-8') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-    except IOError as e:
+            f.flush()
+            os.fsync(f.fileno())
+        deadline = time.monotonic() + _REPLACE_TIMEOUT
+        delay = 0.005
+        while True:
+            try:
+                os.replace(tmp, filepath)
+                return
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.1)
+    except OSError as e:
         logger.error(f"Failed to save {filepath}: {e}")
+        raise LoRStorageError(f"Couldn't save {filepath.name} ({e}).") from e
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def generate_author_id(model_name: str) -> str:
