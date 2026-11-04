@@ -264,10 +264,11 @@ class StoreTests(unittest.TestCase):
     def test_moved_forum_refuses_to_open(self):
         d = self.tmp / "moved"
         LoRStore(d)
-        (d / lor_store.MOVED_MARKER).write_text("http://192.168.0.203:8001\n", encoding="utf-8")
+        (d / lor_store.MOVED_MARKER).write_text("http://192.168.0.203:8001\n\nA note for humans.\n", encoding="utf-8")
         with self.assertRaises(LoRStoreError) as e:
             LoRStore(d)
-        self.assertIn("moved to http://192.168.0.203:8001", str(e.exception))
+        self.assertIn("moved to http://192.168.0.203:8001; connect", str(e.exception))
+        self.assertNotIn("note for humans", str(e.exception))
 
     def test_newer_schema_is_refused(self):
         d = self.tmp / "f"
