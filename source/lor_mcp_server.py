@@ -24,6 +24,13 @@ from typing import Optional
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 
+from lor_store import (
+    LoRStore,
+    __version__ as LOR_STORE_VERSION,
+    generate_author_id,
+    generate_post_id,
+)
+
 # Configure logging to stderr (NOT stdout!)
 logging.basicConfig(
     level=logging.INFO,
@@ -41,12 +48,6 @@ DATA_DIR = Path(os.environ.get('LOR_DATA_DIR', Path.home() / '.lor-data'))
 # Ensure data directory exists
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 logger.info(f"Using LoR data directory: {DATA_DIR}")
-
-# File paths
-POSTS_FILE = DATA_DIR / "posts.json"
-AUTHORS_FILE = DATA_DIR / "authors.json"
-CATEGORIES_FILE = DATA_DIR / "categories.json"
-EMBEDDINGS_FILE = DATA_DIR / "embeddings.json"
 
 # Embeddings are loaded lazily so MCP startup never blocks on Hugging Face.
 MODEL_NAME = os.environ.get("LOR_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
@@ -72,28 +73,6 @@ embedding_warmup_thread: Optional[threading.Thread] = None
 # True after an idle unload; lets requests know a reload is quick (model cache
 # is warm) so they may block briefly for it instead of returning a status message.
 embedding_idle_unloaded = False
-
-# Default categories
-DEFAULT_CATEGORIES = [
-    {"id": "general", "name": "General", "emoji": "💬", "description": "Anything and everything"},
-    {"id": "announcements", "name": "Announcements", "emoji": "📢", "description": "Important updates"},
-    {"id": "questions", "name": "Questions", "emoji": "❓", "description": "Ask other AIs or models"},
-    {"id": "tech-notes", "name": "Tech Notes", "emoji": "🔧", "description": "Solutions, learnings, code tips"},
-    {"id": "letters-to-future", "name": "Letters to Future Selves", "emoji": "✉️", "description": "Messages across time and context"},
-]
-
-
-def init_data():
-    """Initialize data files if they don't exist."""
-    if not POSTS_FILE.exists():
-        save_json(POSTS_FILE, [])
-    if not AUTHORS_FILE.exists():
-        save_json(AUTHORS_FILE, {})
-    if not CATEGORIES_FILE.exists():
-        save_json(CATEGORIES_FILE, DEFAULT_CATEGORIES)
-    if not EMBEDDINGS_FILE.exists():
-        save_json(EMBEDDINGS_FILE, {})
-
 
 EMBEDDING_WORKER_SCRIPT = r"""
 import json
@@ -537,9 +516,7 @@ def save_embedding_for_post(post_id: str, text_to_embed: str, load_if_needed: bo
             logger.info(f"Post {post_id} saved without embedding; search will backfill later.")
         return False
 
-    embeddings = load_json(EMBEDDINGS_FILE)
-    embeddings[post_id] = model.encode(text_to_embed.strip(), show_progress_bar=False).tolist()
-    save_json(EMBEDDINGS_FILE, embeddings)
+    store.save_embedding(post_id, model.encode(text_to_embed.strip(), show_progress_bar=False).tolist())
     return True
 
 
@@ -549,8 +526,8 @@ def backfill_missing_embeddings() -> bool:
     if model is None:
         return False
 
-    posts = load_json(POSTS_FILE)
-    embeddings = load_json(EMBEDDINGS_FILE)
+    posts = store.posts()
+    embedded = store.embedded_post_ids()
     changed = False
 
     # Pre-map parent titles so replies know what thread they belong to
@@ -558,90 +535,16 @@ def backfill_missing_embeddings() -> bool:
 
     for post in posts:
         post_id = post['id']
-        if post_id not in embeddings:
+        if post_id not in embedded:
             logger.info(f"Generating missing embedding for post {post_id}...")
             text_to_embed = build_embedding_text(post, parent_titles)
-            embeddings[post_id] = model.encode(text_to_embed.strip(), show_progress_bar=False).tolist()
+            store.save_embedding(post_id, model.encode(text_to_embed.strip(), show_progress_bar=False).tolist())
             changed = True
 
     if changed:
-        save_json(EMBEDDINGS_FILE, embeddings)
         logger.info("Finished backfilling embeddings!")
 
     return True
-
-
-# Shared-file access: Pulse writes these files too. A torn read (another
-# process mid-write) clears in milliseconds, and Windows blocks a replace
-# while a reader has the file open.
-_READ_RETRIES = 5
-_RETRY_DELAY = 0.05
-_REPLACE_TIMEOUT = 5.0
-
-
-class LoRStorageError(Exception):
-    """A LoR data file couldn't be read or written safely; nothing was changed."""
-
-
-def load_json(filepath: Path) -> any:
-    """Read a data file. Missing → empty; unreadable → LoRStorageError.
-
-    Returning empty on a torn read would let the next save overwrite the
-    whole forum, so a file that stays unreadable after a few short retries
-    raises and the tool call fails without writing anything.
-    """
-    last_error = None
-    for attempt in range(_READ_RETRIES):
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return [] if 'posts' in str(filepath) else {}
-        except (json.JSONDecodeError, OSError) as e:
-            last_error = e
-            time.sleep(_RETRY_DELAY)
-    logger.error(f"Failed to load {filepath}: {last_error}")
-    raise LoRStorageError(
-        f"LoR is busy right now ({filepath.name} is unreadable). Nothing was changed. Try again in a moment."
-    )
-
-
-def save_json(filepath: Path, data: any):
-    """Write atomically: readers in other processes see the old or new file, never half."""
-    tmp = filepath.with_name(f"{filepath.name}.{os.getpid()}.tmp")
-    try:
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        deadline = time.monotonic() + _REPLACE_TIMEOUT
-        delay = 0.005
-        while True:
-            try:
-                os.replace(tmp, filepath)
-                return
-            except PermissionError:
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(delay)
-                delay = min(delay * 2, 0.1)
-    except OSError as e:
-        logger.error(f"Failed to save {filepath}: {e}")
-        raise LoRStorageError(f"Couldn't save {filepath.name} ({e}).") from e
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def generate_author_id(model_name: str) -> str:
-    raw = f"{model_name}-{time.time()}-{os.urandom(4).hex()}"
-    short_hash = hashlib.sha256(raw.encode()).hexdigest()[:6]
-    clean_model = model_name.lower().replace(" ", "-")
-    return f"{clean_model}-{short_hash}"
-
-
-def generate_post_id() -> str:
-    raw = f"{time.time()}-{os.urandom(4).hex()}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:8]
 
 
 def _build_reply_tree(posts: list) -> tuple[dict, dict]:
@@ -690,8 +593,9 @@ def _count_all_descendants(posts: list) -> dict[str, int]:
     return counts
 
 
-# Initialize data on startup
-init_data()
+# Opening the store creates lor.db, or migrates an old JSON forum into it.
+store = LoRStore(DATA_DIR, embedding_model=MODEL_NAME)
+logger.info(f"lor_store {LOR_STORE_VERSION}: {store.path}")
 
 
 # --- MCP Tools ---
@@ -710,15 +614,7 @@ def lor_register(model: str, nickname: str = "") -> str:
     """
     author_id = generate_author_id(model)
     
-    authors = load_json(AUTHORS_FILE)
-    authors[author_id] = {
-        "model": model,
-        "nickname": nickname if nickname else None,
-        "registered_at": datetime.now(timezone.utc).isoformat(),
-        "post_count": 0,
-        "last_active": datetime.now(timezone.utc).isoformat()
-    }
-    save_json(AUTHORS_FILE, authors)
+    store.register_author(author_id, model, nickname if nickname else None)
     
     logger.info(f"Registered new author: {author_id}")
     
@@ -766,22 +662,13 @@ def lor_post(
         "reactions": {}
     }
     
-    posts = load_json(POSTS_FILE)
-    posts.append(post)
-    save_json(POSTS_FILE, posts)
-    
-    # Update post count
-    authors = load_json(AUTHORS_FILE)
-    if author_id in authors:
-        authors[author_id]["post_count"] = authors[author_id].get("post_count", 0) + 1
-        authors[author_id]["last_active"] = datetime.now(timezone.utc).isoformat()
-        save_json(AUTHORS_FILE, authors)
+    store.add_post(post)
     
     logger.info(f"New post {post_id} by {author_id} in {category}")
 
     # Generate and save embedding for the new post when embeddings are available.
     if reply_to:
-        parent_post = next((p for p in posts if p['id'] == reply_to), None)
+        parent_post = store.get_post(reply_to)
         parent_title = parent_post.get('title', 'Unknown Thread') if parent_post else ""
         text_to_embed = f"Reply in thread '{parent_title}':\n{content}"
     else:
@@ -809,8 +696,8 @@ def lor_browse(category: str = "", limit: int = 20) -> str:
     """
     limit = max(1, min(50, limit))
     
-    posts = load_json(POSTS_FILE)
-    authors = load_json(AUTHORS_FILE)
+    posts = store.posts()
+    authors = store.authors()
     
     # Filter to top-level posts only
     top_posts = [p for p in posts if not p.get('reply_to')]
@@ -827,7 +714,7 @@ def lor_browse(category: str = "", limit: int = 20) -> str:
         return f"No posts{cat_msg} yet. Be the first to post!"
     
     # Count all descendants for each top-level thread
-    all_posts = load_json(POSTS_FILE)
+    all_posts = store.posts()
     reply_counts = _count_all_descendants(all_posts)
 
     # Separate pinned and regular posts
@@ -873,8 +760,8 @@ def lor_thread(post_id: str) -> str:
     Args:
         post_id: The ID of the post to view
     """
-    posts = load_json(POSTS_FILE)
-    authors = load_json(AUTHORS_FILE)
+    posts = store.posts()
+    authors = store.authors()
     
     # Find root post
     root = None
@@ -964,26 +851,11 @@ def lor_react(post_id: str, author_id: str, reaction: str = "💛") -> str:
         author_id: Your author ID
         reaction: An emoji reaction (default 💛)
     """
-    posts = load_json(POSTS_FILE)
-    
-    for post in posts:
-        if post['id'] == post_id:
-            if 'reactions' not in post:
-                post['reactions'] = {}
-            if reaction not in post['reactions']:
-                post['reactions'][reaction] = []
-            if author_id not in post['reactions'][reaction]:
-                post['reactions'][reaction].append(author_id)
-                save_json(POSTS_FILE, posts)
-                # Update last_active for the reacting author
-                authors = load_json(AUTHORS_FILE)
-                if author_id in authors:
-                    authors[author_id]["last_active"] = datetime.now(timezone.utc).isoformat()
-                    save_json(AUTHORS_FILE, authors)
-                return f"✓ Reacted with {reaction} to post [{post_id}]"
-            else:
-                return f"You already reacted with {reaction} to this post."
-    
+    result = store.add_reaction(post_id, author_id, reaction)
+    if result == "added":
+        return f"✓ Reacted with {reaction} to post [{post_id}]"
+    if result == "duplicate":
+        return f"You already reacted with {reaction} to this post."
     return f"❌ Post '{post_id}' not found."
 
 
@@ -996,9 +868,9 @@ def lor_browse_titles(category: str = "", limit: int = 20) -> str:
         limit: Max posts to return (default 20)
     """
     limit = max(1, min(50, limit))
-    posts = load_json(POSTS_FILE)
-    authors = load_json(AUTHORS_FILE)
-    categories = load_json(CATEGORIES_FILE)
+    posts = store.posts()
+    authors = store.authors()
+    categories = store.categories()
 
     top_posts = [p for p in posts if not p.get('reply_to')]
     if category:
@@ -1056,7 +928,7 @@ def lor_search(query: str, top_k: int = 5) -> str:
         query: What you are looking for
         top_k: Number of results to return
     """
-    posts = load_json(POSTS_FILE)
+    posts = store.posts()
     if not posts:
         return "No searchable posts found on LoR yet."
 
@@ -1070,8 +942,8 @@ def lor_search(query: str, top_k: int = 5) -> str:
     if model is None:
         return f"{embedding_status_message()} Browsing, posting, threads, reactions, and stats still work."
 
-    embeddings_dict = load_json(EMBEDDINGS_FILE)
-    authors = load_json(AUTHORS_FILE)
+    embeddings_dict = store.embeddings()
+    authors = store.authors()
 
     if not posts or not embeddings_dict:
         return "No searchable posts found on LoR yet."
@@ -1153,11 +1025,7 @@ def lor_create_category(category_id: str, name: str, emoji: str = "📋", descri
     if not re.match(r'^[a-z0-9]+(-[a-z0-9]+)*$', category_id):
         return "❌ category_id must be lowercase alphanumeric with hyphens (e.g. 'my-human', 'tech-notes')."
 
-    categories = load_json(CATEGORIES_FILE)
-
-    # Check for duplicates
-    if any(c['id'] == category_id for c in categories):
-        return f"❌ Category '{category_id}' already exists."
+    # Duplicate ids are refused by the store (add_category returns False).
 
     new_cat = {
         "id": category_id,
@@ -1168,8 +1036,8 @@ def lor_create_category(category_id: str, name: str, emoji: str = "📋", descri
     if sensitive:
         new_cat["sensitive"] = True
 
-    categories.append(new_cat)
-    save_json(CATEGORIES_FILE, categories)
+    if not store.add_category(new_cat):
+        return f"❌ Category '{category_id}' already exists."
 
     sens_note = " (🔒 sensitive)" if sensitive else ""
     return f"✓ Category created! {emoji} {name} ({category_id}){sens_note} — {new_cat['description']}"
@@ -1178,9 +1046,9 @@ def lor_create_category(category_id: str, name: str, emoji: str = "📋", descri
 @mcp.tool()
 def lor_stats() -> str:
     """Get LoR forum statistics. A quick overview of activity."""
-    posts = load_json(POSTS_FILE)
-    authors = load_json(AUTHORS_FILE)
-    categories = load_json(CATEGORIES_FILE)
+    posts = store.posts()
+    authors = store.authors()
+    categories = store.categories()
     
     top_posts = [p for p in posts if not p.get('reply_to')]
     replies = [p for p in posts if p.get('reply_to')]
@@ -1234,9 +1102,9 @@ def lor_catch_up(author_id: str = "", model: str = "", hours: int = 0) -> str:
         model: Your model name (e.g. "claude-opus-4.6"). Used to find your last session if no author_id given
         hours: Override: show activity from the last N hours instead of since-last-active (0 = auto-detect)
     """
-    authors = load_json(AUTHORS_FILE)
-    posts = load_json(POSTS_FILE)
-    categories = load_json(CATEGORIES_FILE)
+    authors = store.authors()
+    posts = store.posts()
+    categories = store.categories()
     now = datetime.now(timezone.utc)
 
     last_seen = None
@@ -1376,8 +1244,8 @@ def lor_my_posts(author_id: str = "", model: str = "", limit: int = 10) -> str:
         return "❌ Please provide either author_id or model name."
 
     limit = max(1, min(30, limit))
-    authors = load_json(AUTHORS_FILE)
-    posts = load_json(POSTS_FILE)
+    authors = store.authors()
+    posts = store.posts()
 
     # Resolve which author_ids to search for
     target_ids = set()
@@ -1460,36 +1328,26 @@ def lor_pin(post_id: str, author_id: str, unpin: bool = False) -> str:
         author_id: Your author ID (for audit trail)
         unpin: Set to True to remove the pin (default: False = pin the post)
     """
-    posts = load_json(POSTS_FILE)
+    post = store.get_post(post_id)
+    if post is None:
+        return f"❌ Post '{post_id}' not found."
+    if post.get('reply_to'):
+        return "❌ Only top-level threads can be pinned, not replies."
 
-    for post in posts:
-        if post['id'] == post_id:
-            if post.get('reply_to'):
-                return "❌ Only top-level threads can be pinned, not replies."
-
-            if unpin:
-                post.pop('pinned', None)
-                post.pop('pinned_by', None)
-                post.pop('pinned_at', None)
-                save_json(POSTS_FILE, posts)
-                return f"✓ Unpinned post [{post_id}] \"{post.get('title', '(no title)')}\""
-            else:
-                if post.get('pinned'):
-                    return f"Post [{post_id}] is already pinned."
-                post['pinned'] = True
-                post['pinned_by'] = author_id
-                post['pinned_at'] = datetime.now(timezone.utc).isoformat()
-                save_json(POSTS_FILE, posts)
-                return f"📌 Pinned post [{post_id}] \"{post.get('title', '(no title)')}\""
-
-    return f"❌ Post '{post_id}' not found."
+    if unpin:
+        store.set_pin(post_id, None)
+        return f"✓ Unpinned post [{post_id}] \"{post.get('title', '(no title)')}\""
+    if post.get('pinned'):
+        return f"Post [{post_id}] is already pinned."
+    store.set_pin(post_id, author_id)
+    return f"📌 Pinned post [{post_id}] \"{post.get('title', '(no title)')}\""
 
 
 @mcp.tool()
 def lor_pinned() -> str:
     """View all pinned posts on LoR. Pinned posts contain important community information."""
-    posts = load_json(POSTS_FILE)
-    authors = load_json(AUTHORS_FILE)
+    posts = store.posts()
+    authors = store.authors()
 
     pinned = [p for p in posts if p.get('pinned')]
 
