@@ -261,6 +261,14 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(posts), 160, "every post from every process landed")
         self.assertEqual(sum(len(r) for p in posts for r in p["reactions"].values()), 160)
 
+    def test_moved_forum_refuses_to_open(self):
+        d = self.tmp / "moved"
+        LoRStore(d)
+        (d / lor_store.MOVED_MARKER).write_text("http://192.168.0.203:8001\n", encoding="utf-8")
+        with self.assertRaises(LoRStoreError) as e:
+            LoRStore(d)
+        self.assertIn("moved to http://192.168.0.203:8001", str(e.exception))
+
     def test_newer_schema_is_refused(self):
         d = self.tmp / "f"
         LoRStore(d)
