@@ -4,7 +4,7 @@ Move a LoR data folder from the old JSON files to lor.db.
 Normally you don't need this: the LoR server and Pulse migrate automatically the
 first time they open the folder. Use it to rehearse first:
 
-    python migrate_json_to_sqlite.py --data-dir D:\\Claude\\LoR\\lor_data --dry-run
+    python migrate_json_to_sqlite.py --data-dir C:\\path\\to\\.lor-data --dry-run
 
 --dry-run copies the folder to a temp dir, migrates the copy, and prints what it
 found, leaving the real folder untouched. Without it, the real folder is migrated

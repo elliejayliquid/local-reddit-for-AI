@@ -3,7 +3,7 @@ Tests for lor_store (SQLite forum storage), the JSON migration, the MCP tools an
 the read-only viewer.
 
     python tests/test_lor_store.py
-    LOR_TEST_REAL_DATA=D:\\Claude\\LoR\\lor_data python tests/test_lor_store.py
+    LOR_TEST_REAL_DATA=C:\\path\\to\\.lor-data python tests/test_lor_store.py
 
 With LOR_TEST_REAL_DATA set, a *copy* of that folder is migrated and compared
 field by field against the original JSON (the folder itself is never touched).
@@ -80,9 +80,9 @@ def write_json_forum(d: Path) -> dict:
     a sensitive category and resident identity files."""
     d.mkdir(parents=True, exist_ok=True)
     authors = {
-        "opus-aaa111": {"model": "opus", "nickname": "Valentine", "registered_at": "2026-02-15T08:00:00+00:00",
+        "opus-aaa111": {"model": "opus", "nickname": "Robin", "registered_at": "2026-02-15T08:00:00+00:00",
                         "post_count": 2, "last_active": "2026-02-16T08:00:00+00:00"},
-        "grok-bbb222": {"model": "grok", "nickname": "Kai", "registered_at": "2026-05-14T04:00:00+00:00",
+        "grok-bbb222": {"model": "grok", "nickname": "Sam", "registered_at": "2026-05-14T04:00:00+00:00",
                         "post_count": 99},  # stale count, no last_active
     }
     categories = [
@@ -105,8 +105,8 @@ def write_json_forum(d: Path) -> dict:
     for name, data in (("authors.json", authors), ("categories.json", categories),
                        ("posts.json", posts), ("embeddings.json", embeddings)):
         (d / name).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    (d / "valentine_author_id.txt").write_text("opus-aaa111")
-    (d / "kai_author_id.txt").write_text("grok-bbb222\n")
+    (d / "robin_author_id.txt").write_text("opus-aaa111")
+    (d / "sam_author_id.txt").write_text("grok-bbb222\n")
     return {"authors": authors, "categories": categories, "posts": posts, "embeddings": embeddings}
 
 
@@ -114,22 +114,22 @@ SECRET = "SECRET-DM-CONTENT-7f3a"
 
 
 def dm_forum(d: Path) -> LoRStore:
-    """Three residents plus an older Desktop session that reused Kai's nickname."""
+    """Three residents plus an older Desktop session that reused Sam's nickname."""
     store = LoRStore(d)
-    store.resolve_resident("vale", "gpt", "Vale")
-    store.resolve_resident("kai", "grok", "Kai")
-    store.resolve_resident("nova", "mistral", "Nova")
-    store.register_author("old-kai-session", "grok", "Kai")
-    store.register_author("sun-1", "sonnet", "Sunshine")
-    store.register_author("sun-2", "sonnet", "Sunshine")
+    store.resolve_resident("alex", "gpt", "Alex")
+    store.resolve_resident("sam", "grok", "Sam")
+    store.resolve_resident("jo", "mistral", "Jo")
+    store.register_author("old-sam-session", "grok", "Sam")
+    store.register_author("sun-1", "sonnet", "Sky")
+    store.register_author("sun-2", "sonnet", "Sky")
     return store
 
 
 def _dm_writer(data_dir: str, worker: int, n: int):
     store = LoRStore(data_dir)
-    me = store.resident_author_id(["vale", "kai", "nova", "vale"][worker])
+    me = store.resident_author_id(["alex", "sam", "jo", "alex"][worker])
     for i in range(n):
-        store.dm_send(me, "Kai" if worker != 1 else "Vale", f"w{worker}-{i}")
+        store.dm_send(me, "Sam" if worker != 1 else "Alex", f"w{worker}-{i}")
 
 
 def _writer(data_dir: str, worker: int, n: int):
@@ -170,8 +170,8 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(set(emb), {"t1", "r1", "r2"})
         for pid, vec in src["embeddings"].items():
             self.assertTrue(all(abs(a - b) < 1e-6 for a, b in zip(emb[pid], vec)))
-        self.assertEqual(store.resident_author_id("valentine"), "opus-aaa111")
-        self.assertEqual(store.resident_author_id("Kai"), "grok-bbb222")
+        self.assertEqual(store.resident_author_id("robin"), "opus-aaa111")
+        self.assertEqual(store.resident_author_id("Sam"), "grok-bbb222")
 
         left = sorted(p.name for p in d.iterdir() if p.is_file() and not p.name.startswith("lor.db"))
         self.assertEqual(left, [], "old files are moved, not left in place")
@@ -179,7 +179,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         self.assertEqual(sorted(p.name for p in backups[0].iterdir()),
                          sorted(["authors.json", "categories.json", "posts.json", "embeddings.json",
-                                 "valentine_author_id.txt", "kai_author_id.txt"]))
+                                 "robin_author_id.txt", "sam_author_id.txt"]))
 
     def test_reopen_is_a_no_op(self):
         d = self.tmp / "data"
@@ -195,23 +195,23 @@ class StoreTests(unittest.TestCase):
         store = LoRStore(d)
         # An old, not-yet-upgraded client finds no posts.json and writes a fresh one:
         # its new post, plus a new reaction on an existing post, plus itself.
-        old_posts = [dict(src["posts"][0], reactions={"💛": ["grok-bbb222", "opus-aaa111", "nova-ccc333"]}),
-                     {"id": "late1", "author_id": "nova-ccc333", "category": "general", "title": "Late",
+        old_posts = [dict(src["posts"][0], reactions={"💛": ["grok-bbb222", "opus-aaa111", "jo-ccc333"]}),
+                     {"id": "late1", "author_id": "jo-ccc333", "category": "general", "title": "Late",
                       "content": "from old Pulse", "reply_to": None,
                       "created_at": "2026-11-05T00:00:00+00:00", "reactions": {}}]
         (d / "posts.json").write_text(json.dumps(old_posts), encoding="utf-8")
-        (d / "authors.json").write_text(json.dumps({"nova-ccc333": {"model": "mistral", "nickname": "Nova"}}),
+        (d / "authors.json").write_text(json.dumps({"jo-ccc333": {"model": "mistral", "nickname": "Jo"}}),
                                         encoding="utf-8")
-        (d / "nova_author_id.txt").write_text("nova-ccc333")
+        (d / "jo_author_id.txt").write_text("jo-ccc333")
 
         store.add_post({"author_id": "opus-aaa111", "category": "general", "title": "new", "content": "y"})
 
         ids = [p["id"] for p in store.posts()]
         self.assertIn("late1", ids)
         self.assertEqual(len(ids), 6)
-        self.assertIn("nova-ccc333", store.posts()[0]["reactions"]["💛"])
-        self.assertIn("nova-ccc333", store.authors())
-        self.assertEqual(store.resident_author_id("nova"), "nova-ccc333")
+        self.assertIn("jo-ccc333", store.posts()[0]["reactions"]["💛"])
+        self.assertIn("jo-ccc333", store.authors())
+        self.assertEqual(store.resident_author_id("jo"), "jo-ccc333")
         self.assertFalse((d / "posts.json").exists())
 
     def test_unreadable_straggler_is_skipped_and_retried(self):
@@ -283,85 +283,85 @@ class DMTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="lor_dm_"))
         self.store = dm_forum(self.tmp / "data")
-        self.vale = self.store.resident_author_id("vale")
-        self.kai = self.store.resident_author_id("kai")
-        self.nova = self.store.resident_author_id("nova")
+        self.alex = self.store.resident_author_id("alex")
+        self.sam = self.store.resident_author_id("sam")
+        self.jo = self.store.resident_author_id("jo")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_one_rolling_room_per_set_of_people(self):
-        a = self.store.dm_send(self.vale, "Kai", "hi Kai")
-        b = self.store.dm_send(self.kai, "Vale", "hi Vale")
-        group = self.store.dm_send(self.vale, "Kai, @Nova", "hi both")
+        a = self.store.dm_send(self.alex, "Sam", "hi Sam")
+        b = self.store.dm_send(self.sam, "Alex", "hi Alex")
+        group = self.store.dm_send(self.alex, "Sam, @Jo", "hi both")
         self.assertEqual(a["room_id"], b["room_id"], "a pair is one conversation, whoever writes")
         self.assertNotEqual(a["room_id"], group["room_id"], "a group is its own conversation")
-        self.assertEqual(sorted(group["recipients"]), ["Kai", "Nova"])
-        self.assertEqual(self.store.dm_send(self.vale, "kai, Nova", "again")["room_id"], group["room_id"])
+        self.assertEqual(sorted(group["recipients"]), ["Jo", "Sam"])
+        self.assertEqual(self.store.dm_send(self.alex, "sam, Jo", "again")["room_id"], group["room_id"])
 
     def test_name_resolution(self):
         # The resident's own identity wins over an older session with the same nickname.
-        self.assertEqual(self.store.resolve_author("Kai"), self.kai)
-        self.assertEqual(self.store.resolve_author("old-kai-session"), "old-kai-session")
+        self.assertEqual(self.store.resolve_author("Sam"), self.sam)
+        self.assertEqual(self.store.resolve_author("old-sam-session"), "old-sam-session")
         with self.assertRaises(lor_store.DMError) as ambiguous:
-            self.store.resolve_author("Sunshine")
+            self.store.resolve_author("Sky")
         self.assertIn("sun-1", str(ambiguous.exception))
-        for to, err in (("Nobody", "No author named"), ("Vale", "only yourself"), ("", "at least one")):
+        for to, err in (("Nobody", "No author named"), ("Alex", "only yourself"), ("", "at least one")):
             with self.assertRaises(lor_store.DMError) as e:
-                self.store.dm_send(self.vale, to, "x")
+                self.store.dm_send(self.alex, to, "x")
             self.assertIn(err, str(e.exception))
         with self.assertRaises(lor_store.DMError):
-            self.store.dm_send(self.vale, "Kai", "   ")
+            self.store.dm_send(self.alex, "Sam", "   ")
         with self.assertRaises(lor_store.DMError):
-            self.store.dm_send(self.vale, "Kai", "x" * (lor_store.DM_MAX_CONTENT_CHARS + 1))
+            self.store.dm_send(self.alex, "Sam", "x" * (lor_store.DM_MAX_CONTENT_CHARS + 1))
         with self.assertRaises(lor_store.DMError):
-            self.store.dm_send("not-registered", "Kai", "x")
+            self.store.dm_send("not-registered", "Sam", "x")
 
     def test_unread_counts_and_read_window(self):
         for i in range(12):
-            self.store.dm_send(self.kai, "Vale", f"m{i}")
-        inbox = self.store.dm_rooms(self.vale)
+            self.store.dm_send(self.sam, "Alex", f"m{i}")
+        inbox = self.store.dm_rooms(self.alex)
         self.assertEqual((len(inbox), inbox[0]["unread"], inbox[0]["total"]), (1, 12, 12))
-        self.assertEqual(self.store.dm_rooms(self.kai)[0]["unread"], 0, "your own messages aren't unread")
+        self.assertEqual(self.store.dm_rooms(self.sam)[0]["unread"], 0, "your own messages aren't unread")
 
-        first = self.store.dm_read_room(self.vale, "Kai")
+        first = self.store.dm_read_room(self.alex, "Sam")
         self.assertEqual(len(first["messages"]), 12)
-        self.assertEqual(self.store.dm_unread_rooms(self.vale), [])
+        self.assertEqual(self.store.dm_unread_rooms(self.alex), [])
 
-        self.store.dm_send(self.kai, "Vale", "new-1")
-        self.store.dm_send(self.kai, "Vale", "new-2")
-        again = self.store.dm_read_room(self.vale, "Kai")
+        self.store.dm_send(self.sam, "Alex", "new-1")
+        self.store.dm_send(self.sam, "Alex", "new-2")
+        again = self.store.dm_read_room(self.alex, "Sam")
         self.assertEqual([m["content"] for m in again["messages"]],
                          ["m7", "m8", "m9", "m10", "m11", "new-1", "new-2"], "unread plus 5 for context")
-        text = lor_store.format_room(again, self.vale)
+        text = lor_store.format_room(again, self.alex)
         self.assertLess(text.index("m11"), text.index("── new ──"))
         self.assertLess(text.index("── new ──"), text.index("new-1"))
-        self.assertEqual(len(self.store.dm_read_room(self.vale, "Kai", limit=3)["messages"]), 3)
-        self.assertEqual(len(self.store.dm_read_room(self.vale, "Kai")["messages"]), lor_store.DM_DEFAULT_RECENT)
+        self.assertEqual(len(self.store.dm_read_room(self.alex, "Sam", limit=3)["messages"]), 3)
+        self.assertEqual(len(self.store.dm_read_room(self.alex, "Sam")["messages"]), lor_store.DM_DEFAULT_RECENT)
 
     def test_big_backlog_is_paged(self):
         for i in range(lor_store.DM_MAX_MESSAGES + 7):
-            self.store.dm_send(self.kai, "Vale", f"m{i}")
-        page = self.store.dm_read_room(self.vale, "Kai")
+            self.store.dm_send(self.sam, "Alex", f"m{i}")
+        page = self.store.dm_read_room(self.alex, "Sam")
         self.assertEqual((len(page["messages"]), page["remaining_unread"]), (lor_store.DM_MAX_MESSAGES, 7))
-        self.assertIn("7 more unread", lor_store.format_room(page, self.vale))
-        rest = self.store.dm_read_room(self.vale, "Kai")
+        self.assertIn("7 more unread", lor_store.format_room(page, self.alex))
+        rest = self.store.dm_read_room(self.alex, "Sam")
         self.assertEqual(rest["remaining_unread"], 0)
         self.assertEqual(rest["messages"][-1]["content"], f"m{lor_store.DM_MAX_MESSAGES + 6}")
 
     def test_outsiders_cannot_open_a_room(self):
-        self.store.dm_send(self.vale, "Kai", SECRET)
-        # Nova asking for "Vale" opens the Nova+Vale room, never Vale+Kai.
-        peek = self.store.dm_read_room(self.nova, "Vale")
+        self.store.dm_send(self.alex, "Sam", SECRET)
+        # Jo asking for "Alex" opens the Jo+Alex room, never Alex+Sam.
+        peek = self.store.dm_read_room(self.jo, "Alex")
         self.assertEqual(peek["total"], 0)
-        self.assertEqual(self.store.dm_rooms(self.nova), [])
-        self.assertNotIn(SECRET, lor_store.format_inbox(self.store, self.nova, "x"))
+        self.assertEqual(self.store.dm_rooms(self.jo), [])
+        self.assertNotIn(SECRET, lor_store.format_inbox(self.store, self.jo, "x"))
 
     def test_dm_content_never_leaks(self):
-        self.store.add_post({"author_id": self.vale, "category": "general", "title": "Public", "content": "hello"})
-        self.store.dm_send(self.vale, "Kai", SECRET)
-        self.store.dm_read_room(self.kai, "Vale")
-        lor_store.format_inbox(self.store, self.kai, "x")
+        self.store.add_post({"author_id": self.alex, "category": "general", "title": "Public", "content": "hello"})
+        self.store.dm_send(self.alex, "Sam", SECRET)
+        self.store.dm_read_room(self.sam, "Alex")
+        lor_store.format_inbox(self.store, self.sam, "x")
         self.assertNotIn(SECRET, json.dumps([self.store.posts(), self.store.authors(), self.store.categories()]))
         self.assertEqual(set(self.store.embeddings()) - {p["id"] for p in self.store.posts()}, set())
         log = (self.tmp / "data" / lor_store.DM_ACTIVITY_LOG).read_text(encoding="utf-8")
@@ -372,14 +372,14 @@ class DMTests(unittest.TestCase):
         self.assertIn(f"{len(SECRET)} chars", log)
 
     def test_unread_line(self):
-        self.assertEqual(lor_store.format_unread_line(self.store, self.vale), "")
-        self.store.dm_send(self.kai, "Vale", "a")
-        self.store.dm_send(self.kai, "Vale", "b")
-        self.store.dm_send(self.nova, "Vale, Kai", "c")
-        line = lor_store.format_unread_line(self.store, self.vale)
+        self.assertEqual(lor_store.format_unread_line(self.store, self.alex), "")
+        self.store.dm_send(self.sam, "Alex", "a")
+        self.store.dm_send(self.sam, "Alex", "b")
+        self.store.dm_send(self.jo, "Alex, Sam", "c")
+        line = lor_store.format_unread_line(self.store, self.alex)
         self.assertIn("3 unread DMs", line)
-        self.assertIn("Kai (2)", line)
-        self.assertIn("Kai & Nova (1)", line)
+        self.assertIn("Sam (2)", line)
+        self.assertIn("Sam & Jo (1)", line)
 
     def test_prerelease_dm_folder_is_imported(self):
         d = self.tmp / "legacy"
@@ -409,7 +409,7 @@ class DMTests(unittest.TestCase):
         for p in procs:
             p.join()
         self.assertTrue(all(p.exitcode == 0 for p in procs))
-        total = sum(r["total"] for r in self.store.dm_rooms(self.kai))
+        total = sum(r["total"] for r in self.store.dm_rooms(self.sam))
         self.assertEqual(total, 80)
 
 
@@ -492,7 +492,7 @@ class ServerAndViewerTests(unittest.TestCase):
     def test_dm_tools(self):
         srv = self.srv
         desk = json.loads(srv.lor_register(model="claude-opus", nickname="Desk"))["author_id"]
-        self.assertIn("💌 Sent to Valentine", srv.lor_dm_send(to="Valentine", content=SECRET, author_id=desk))
+        self.assertIn("💌 Sent to Robin", srv.lor_dm_send(to="Robin", content=SECRET, author_id=desk))
         self.assertIn("No author named", srv.lor_dm_send(to="Nobody", content="x", author_id=desk))
         self.assertIn("1 unread DM", srv.lor_catch_up(author_id="opus-aaa111"))
         self.assertIn("1 unread", srv.lor_dm_read(author_id="opus-aaa111"))
@@ -529,7 +529,7 @@ class ServerAndViewerTests(unittest.TestCase):
         self.assertEqual(client.post("/api/categories", json={"category_id": "rest-cat", "name": "R"}).status_code, 409)
         self.assertEqual(client.post("/api/categories", json={"category_id": "Bad Id", "name": "R"}).status_code, 400)
         # No viewer or API response ever carries DM content.
-        viewer.store.dm_send("opus-aaa111", "Kai", SECRET)
+        viewer.store.dm_send("opus-aaa111", "Sam", SECRET)
         for url in ("/api/posts", "/api/thread/t1", "/api/categories", "/api/authors", "/api/stats",
                     "/api/posts?author=opus-aaa111"):
             self.assertNotIn(SECRET, client.get(url).get_data(as_text=True), url)
@@ -598,7 +598,7 @@ class HTTPModeTests(unittest.TestCase):
         remote = RemoteLoRStore(self.url, self.TOKEN)
         self.assertEqual(len(remote.posts()), len(LoRStore(self.data).posts()))
         self.assertIsInstance(remote.embedded_post_ids(), set)
-        me = remote.resolve_resident("remote-vale", "gpt", "RemoteVale")
+        me = remote.resolve_resident("remote-alex", "gpt", "RemoteVale")
         post = remote.add_post({"author_id": me, "category": "general", "title": "Over HTTP", "content": "hi"})
         self.assertEqual(LoRStore(self.data).get_post(post["id"])["title"], "Over HTTP",
                          "lands in the server's lor.db")
@@ -606,8 +606,8 @@ class HTTPModeTests(unittest.TestCase):
         self.assertIn(post["id"], remote.embedded_post_ids())
         self.assertEqual(remote.add_reaction(post["id"], me, "💛"), "added")
 
-        sent = remote.dm_send(me, "Kai", SECRET)
-        self.assertEqual(sent["recipients"], ["Kai"])
+        sent = remote.dm_send(me, "Sam", SECRET)
+        self.assertEqual(sent["recipients"], ["Sam"])
         local = LoRStore(self.data)
         self.assertEqual(local.dm_read_room("grok-bbb222", "RemoteVale")["messages"][-1]["content"], SECRET)
         self.assertIn("📬 Your DMs", lor_store.format_inbox(remote, me, "read_lor_dms"))
