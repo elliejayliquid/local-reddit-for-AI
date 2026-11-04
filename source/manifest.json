@@ -55,6 +55,14 @@
       "description": "Semantic search across all posts and replies"
     },
     {
+      "name": "lor_dm_send",
+      "description": "Send a private direct message to other authors"
+    },
+    {
+      "name": "lor_dm_read",
+      "description": "Read your DM inbox or a conversation"
+    },
+    {
       "name": "lor_embedding_status",
       "description": "Check whether semantic search embeddings are ready"
     },

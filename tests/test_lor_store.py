@@ -60,6 +60,28 @@ def write_json_forum(d: Path) -> dict:
     return {"authors": authors, "categories": categories, "posts": posts, "embeddings": embeddings}
 
 
+SECRET = "SECRET-DM-CONTENT-7f3a"
+
+
+def dm_forum(d: Path) -> LoRStore:
+    """Three residents plus an older Desktop session that reused Kai's nickname."""
+    store = LoRStore(d)
+    store.resolve_resident("vale", "gpt", "Vale")
+    store.resolve_resident("kai", "grok", "Kai")
+    store.resolve_resident("nova", "mistral", "Nova")
+    store.register_author("old-kai-session", "grok", "Kai")
+    store.register_author("sun-1", "sonnet", "Sunshine")
+    store.register_author("sun-2", "sonnet", "Sunshine")
+    return store
+
+
+def _dm_writer(data_dir: str, worker: int, n: int):
+    store = LoRStore(data_dir)
+    me = store.resident_author_id(["vale", "kai", "nova", "vale"][worker])
+    for i in range(n):
+        store.dm_send(me, "Kai" if worker != 1 else "Vale", f"w{worker}-{i}")
+
+
 def _writer(data_dir: str, worker: int, n: int):
     store = LoRStore(data_dir)
     for i in range(n):
@@ -198,6 +220,140 @@ class StoreTests(unittest.TestCase):
             LoRStore(d)
 
 
+class DMTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="lor_dm_"))
+        self.store = dm_forum(self.tmp / "data")
+        self.vale = self.store.resident_author_id("vale")
+        self.kai = self.store.resident_author_id("kai")
+        self.nova = self.store.resident_author_id("nova")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_one_rolling_room_per_set_of_people(self):
+        a = self.store.dm_send(self.vale, "Kai", "hi Kai")
+        b = self.store.dm_send(self.kai, "Vale", "hi Vale")
+        group = self.store.dm_send(self.vale, "Kai, @Nova", "hi both")
+        self.assertEqual(a["room_id"], b["room_id"], "a pair is one conversation, whoever writes")
+        self.assertNotEqual(a["room_id"], group["room_id"], "a group is its own conversation")
+        self.assertEqual(sorted(group["recipients"]), ["Kai", "Nova"])
+        self.assertEqual(self.store.dm_send(self.vale, "kai, Nova", "again")["room_id"], group["room_id"])
+
+    def test_name_resolution(self):
+        # The resident's own identity wins over an older session with the same nickname.
+        self.assertEqual(self.store.resolve_author("Kai"), self.kai)
+        self.assertEqual(self.store.resolve_author("old-kai-session"), "old-kai-session")
+        with self.assertRaises(lor_store.DMError) as ambiguous:
+            self.store.resolve_author("Sunshine")
+        self.assertIn("sun-1", str(ambiguous.exception))
+        for to, err in (("Nobody", "No author named"), ("Vale", "only yourself"), ("", "at least one")):
+            with self.assertRaises(lor_store.DMError) as e:
+                self.store.dm_send(self.vale, to, "x")
+            self.assertIn(err, str(e.exception))
+        with self.assertRaises(lor_store.DMError):
+            self.store.dm_send(self.vale, "Kai", "   ")
+        with self.assertRaises(lor_store.DMError):
+            self.store.dm_send(self.vale, "Kai", "x" * (lor_store.DM_MAX_CONTENT_CHARS + 1))
+        with self.assertRaises(lor_store.DMError):
+            self.store.dm_send("not-registered", "Kai", "x")
+
+    def test_unread_counts_and_read_window(self):
+        for i in range(12):
+            self.store.dm_send(self.kai, "Vale", f"m{i}")
+        inbox = self.store.dm_rooms(self.vale)
+        self.assertEqual((len(inbox), inbox[0]["unread"], inbox[0]["total"]), (1, 12, 12))
+        self.assertEqual(self.store.dm_rooms(self.kai)[0]["unread"], 0, "your own messages aren't unread")
+
+        first = self.store.dm_read_room(self.vale, "Kai")
+        self.assertEqual(len(first["messages"]), 12)
+        self.assertEqual(self.store.dm_unread_rooms(self.vale), [])
+
+        self.store.dm_send(self.kai, "Vale", "new-1")
+        self.store.dm_send(self.kai, "Vale", "new-2")
+        again = self.store.dm_read_room(self.vale, "Kai")
+        self.assertEqual([m["content"] for m in again["messages"]],
+                         ["m7", "m8", "m9", "m10", "m11", "new-1", "new-2"], "unread plus 5 for context")
+        text = lor_store.format_room(again, self.vale)
+        self.assertLess(text.index("m11"), text.index("── new ──"))
+        self.assertLess(text.index("── new ──"), text.index("new-1"))
+        self.assertEqual(len(self.store.dm_read_room(self.vale, "Kai", limit=3)["messages"]), 3)
+        self.assertEqual(len(self.store.dm_read_room(self.vale, "Kai")["messages"]), lor_store.DM_DEFAULT_RECENT)
+
+    def test_big_backlog_is_paged(self):
+        for i in range(lor_store.DM_MAX_MESSAGES + 7):
+            self.store.dm_send(self.kai, "Vale", f"m{i}")
+        page = self.store.dm_read_room(self.vale, "Kai")
+        self.assertEqual((len(page["messages"]), page["remaining_unread"]), (lor_store.DM_MAX_MESSAGES, 7))
+        self.assertIn("7 more unread", lor_store.format_room(page, self.vale))
+        rest = self.store.dm_read_room(self.vale, "Kai")
+        self.assertEqual(rest["remaining_unread"], 0)
+        self.assertEqual(rest["messages"][-1]["content"], f"m{lor_store.DM_MAX_MESSAGES + 6}")
+
+    def test_outsiders_cannot_open_a_room(self):
+        self.store.dm_send(self.vale, "Kai", SECRET)
+        # Nova asking for "Vale" opens the Nova+Vale room, never Vale+Kai.
+        peek = self.store.dm_read_room(self.nova, "Vale")
+        self.assertEqual(peek["total"], 0)
+        self.assertEqual(self.store.dm_rooms(self.nova), [])
+        self.assertNotIn(SECRET, lor_store.format_inbox(self.store, self.nova, "x"))
+
+    def test_dm_content_never_leaks(self):
+        self.store.add_post({"author_id": self.vale, "category": "general", "title": "Public", "content": "hello"})
+        self.store.dm_send(self.vale, "Kai", SECRET)
+        self.store.dm_read_room(self.kai, "Vale")
+        lor_store.format_inbox(self.store, self.kai, "x")
+        self.assertNotIn(SECRET, json.dumps([self.store.posts(), self.store.authors(), self.store.categories()]))
+        self.assertEqual(set(self.store.embeddings()) - {p["id"] for p in self.store.posts()}, set())
+        log = (self.tmp / "data" / lor_store.DM_ACTIVITY_LOG).read_text(encoding="utf-8")
+        self.assertIn("SEND", log)
+        self.assertIn("READ", log)
+        self.assertIn("INBOX", log)
+        self.assertNotIn(SECRET, log, "the activity log never holds content")
+        self.assertIn(f"{len(SECRET)} chars", log)
+
+    def test_unread_line(self):
+        self.assertEqual(lor_store.format_unread_line(self.store, self.vale), "")
+        self.store.dm_send(self.kai, "Vale", "a")
+        self.store.dm_send(self.kai, "Vale", "b")
+        self.store.dm_send(self.nova, "Vale, Kai", "c")
+        line = lor_store.format_unread_line(self.store, self.vale)
+        self.assertIn("3 unread DMs", line)
+        self.assertIn("Kai (2)", line)
+        self.assertIn("Kai & Nova (1)", line)
+
+    def test_prerelease_dm_folder_is_imported(self):
+        d = self.tmp / "legacy"
+        write_json_forum(d)
+        participants = sorted(["opus-aaa111", "grok-bbb222"])
+        room = lor_store.room_id_for(participants)
+        (d / "dms" / "rooms").mkdir(parents=True)
+        (d / "dms" / "read").mkdir()
+        msgs = [{"id": f"m{i}", "room": room, "participants": participants, "from": "grok-bbb222",
+                 "content": f"old {i}", "created_at": f"2026-11-04T0{i}:00:00+00:00"} for i in range(3)]
+        lines = "\n".join(json.dumps(m) for m in msgs) + '\n{"id": "torn'
+        (d / "dms" / "rooms" / f"{room}.jsonl").write_text(lines, encoding="utf-8")
+        (d / "dms" / "read" / "opus-aaa111.json").write_text(
+            json.dumps({room: "2026-11-04T00:00:00+00:00"}), encoding="utf-8")
+
+        store = LoRStore(d)
+        self.assertEqual(store.dm_rooms("opus-aaa111")[0]["unread"], 2, "read cursor carried over")
+        self.assertEqual(len(store.dm_read_room("opus-aaa111", "grok-bbb222")["messages"]), 3)
+        self.assertFalse((d / "dms").exists())
+        self.assertTrue(list(d.glob("json_backup_*/dms/rooms/*.jsonl")))
+
+    def test_concurrent_dm_senders_lose_nothing(self):
+        d = str(self.tmp / "data")
+        procs = [mp.Process(target=_dm_writer, args=(d, w, 20)) for w in range(4)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join()
+        self.assertTrue(all(p.exitcode == 0 for p in procs))
+        total = sum(r["total"] for r in self.store.dm_rooms(self.kai))
+        self.assertEqual(total, 80)
+
+
 @unittest.skipUnless(os.environ.get("LOR_TEST_REAL_DATA"), "set LOR_TEST_REAL_DATA to a lor_data folder")
 class RealDataTests(unittest.TestCase):
     def test_real_forum_migrates_exactly(self):
@@ -274,6 +430,22 @@ class ServerAndViewerTests(unittest.TestCase):
         self.assertTrue(srv.lor_catch_up(author_id=me))
         self.assertIn("SQLite!", srv.lor_my_posts(author_id=me))
 
+    def test_dm_tools(self):
+        srv = self.srv
+        desk = json.loads(srv.lor_register(model="claude-opus", nickname="Desk"))["author_id"]
+        self.assertIn("💌 Sent to Valentine", srv.lor_dm_send(to="Valentine", content=SECRET, author_id=desk))
+        self.assertIn("No author named", srv.lor_dm_send(to="Nobody", content="x", author_id=desk))
+        self.assertIn("1 unread DM", srv.lor_catch_up(author_id="opus-aaa111"))
+        self.assertIn("1 unread", srv.lor_dm_read(author_id="opus-aaa111"))
+        room = srv.lor_dm_read(author_id="opus-aaa111", with_authors="Desk")
+        self.assertIn(SECRET, room)
+        self.assertIn("── new ──", room)
+        self.assertNotIn("unread DM", srv.lor_catch_up(author_id="opus-aaa111"))
+        # The forum-facing tools never show DM content.
+        for out in (srv.lor_browse(), srv.lor_browse_titles(), srv.lor_stats(), srv.lor_pinned(),
+                    srv.lor_catch_up(author_id=desk), srv.lor_my_posts(author_id=desk)):
+            self.assertNotIn(SECRET, out)
+
     def test_viewer_api_and_hides_sensitive(self):
         sys.path.insert(0, str(ROOT / "frontend"))
         import lor_server as viewer
@@ -296,6 +468,12 @@ class ServerAndViewerTests(unittest.TestCase):
         self.assertEqual(client.post("/api/categories", json={"category_id": "rest-cat", "name": "R"}).status_code, 200)
         self.assertEqual(client.post("/api/categories", json={"category_id": "rest-cat", "name": "R"}).status_code, 409)
         self.assertEqual(client.post("/api/categories", json={"category_id": "Bad Id", "name": "R"}).status_code, 400)
+        # No viewer or API response ever carries DM content.
+        viewer.store.dm_send("opus-aaa111", "Kai", SECRET)
+        for url in ("/api/posts", "/api/thread/t1", "/api/categories", "/api/authors", "/api/stats",
+                    "/api/posts?author=opus-aaa111"):
+            self.assertNotIn(SECRET, client.get(url).get_data(as_text=True), url)
+
         viewer.HIDE_SENSITIVE = True
         try:
             titles = [p["title"] for p in client.get("/api/posts").get_json()["posts"]]
