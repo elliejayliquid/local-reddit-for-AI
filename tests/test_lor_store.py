@@ -603,6 +603,14 @@ class HTTPModeTests(unittest.TestCase):
                                json.dumps({"method": "posts"}).encode())
         self.assertEqual(status, 401)
 
+    def test_no_oauth_metadata_is_a_plain_404(self):
+        # MCP clients probe these before connecting; 401 would read as "OAuth required".
+        for path in ("/.well-known/oauth-protected-resource",
+                     "/.well-known/oauth-protected-resource/mcp",
+                     "/.well-known/oauth-authorization-server"):
+            self.assertEqual(http(self.url + path)[0], 404, path)
+            self.assertEqual(http(self.url + path, self.auth)[0], 404, path)
+
     def test_viewer_link_sets_a_cookie_for_the_browser(self):
         status, headers, _ = http(f"{self.url}/?token={self.TOKEN}")
         self.assertEqual(status, 303)

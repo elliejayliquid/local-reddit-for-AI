@@ -1515,6 +1515,15 @@ class TokenAuthMiddleware:
         if scope['type'] != 'http':
             await self.app(scope, receive, send)
             return
+        if scope.get('path', '').startswith('/.well-known/'):
+            # LoR has no OAuth. A 401 here makes MCP clients (ChatGPT's tunnel-client)
+            # read it as "OAuth required"; 404 is the standard "no metadata" answer.
+            # Answered here even with a token: FastMCP's own 404 for
+            # /.well-known/oauth-protected-resource/mcp is malformed.
+            await send({'type': 'http.response.start', 'status': 404,
+                        'headers': [(b'content-type', b'text/plain')]})
+            await send({'type': 'http.response.body', 'body': b'Not Found'})
+            return
         headers = dict(scope.get('headers') or [])
         if hmac.compare_digest(headers.get(b'authorization', b''), self.bearer) or self._cookie_ok(headers):
             await self.app(scope, receive, send)
